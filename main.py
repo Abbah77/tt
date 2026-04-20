@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Query
-from fastapi.middleware.cors
-import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 import os
 from dotenv import load_dotenv
@@ -9,7 +8,6 @@ load_dotenv()
 
 app = FastAPI()
 
-# Allow all origins for testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,8 +20,8 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-CHUNK_SIZE = 20  # videos per page
-PRELOAD = 3      # chunks to preload ahead
+CHUNK_SIZE = 20
+PRELOAD = 3
 
 @app.get("/")
 def root():
@@ -31,18 +29,14 @@ def root():
 
 @app.get("/feed")
 def get_feed(page: int = Query(default=1, ge=1)):
-    
-    # Calculate range
     start = (page - 1) * CHUNK_SIZE
     end = start + CHUNK_SIZE - 1
 
-    # Fetch current chunk
     result = supabase.table("videos")\
         .select("*")\
         .range(start, end)\
         .execute()
 
-    # Fetch next 2 chunks in background (preload hint)
     next_start = end + 1
     next_end = next_start + (CHUNK_SIZE * PRELOAD) - 1
 
@@ -75,6 +69,6 @@ def get_video(video_id: str):
         .execute()
 
     if not result.data:
-        return {"error": "Video not found"}, 404
+        return {"error": "Video not found"}
 
     return result.data
