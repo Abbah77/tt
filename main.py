@@ -1,17 +1,15 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import RedirectResponse
 from supabase import create_client
-import os
-import random
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Reelz API", version="1.0.0")
 
-app.add_middleware(GZipMiddleware, minimum_size=500)
-
+# CORS — allow all origins (lock down in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,97 +17,180 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-supabase = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
-)
+# Supabase
+supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+CDN = os.getenv("CDN_BASE", "https://reelz.dpdns.org")
 
-CHUNK_SIZE = 20
-PRELOAD_CHUNKS = 3
-TOTAL_VIDEOS = 6129  # update this if you ingest more later
+# ── Helpers ──────────────────────────────────────
 
-def swap_to_fast_url(video_url: str) -> str:
-    if not video_url:
-        return video_url
-    if video_url.endswith('.ia.mp4'):
-        return video_url
-    return video_url.replace('.mp4', '.ia.mp4')
+def cdn_url(r2_key: str) -> str:
+    if not r2_key:
+        return None
+    return f"{CDN}/{r2_key}"
 
-def clean_video(video: dict) -> dict:
+def make_movie_response(movie: dict) -> dict:
     return {
-        "id": video.get("id"),
-        "video_url": swap_to_fast_url(video.get("video_url", "")),
-        "thumbnail_url": video.get("thumbnail_url"),
-        "caption": video.get("caption", ""),
-        "hashtags": video.get("hashtags", ""),
+        "id": movie["id"],
+        "title": movie["title"],
+        "slug": movie["slug"],
+        "thumbnail_url": cdn_url(movie.get("thumbnail")),
+        "trailer_url": cdn_url(movie.get("trailer")),
+        "created_at": str(movie.get("created_at", "")),
     }
 
-def get_random_offsets(count: int) -> list:
-    """Generate random unique row offsets"""
-    max_offset = TOTAL_VIDEOS - 1
-    offsets = random.sample(range(0, max_offset), min(count, max_offset))
-    return offsets
+def make_episode_response(ep: dict) -> dict:
+    return {
+        "id": ep["id"],
+        "episode_number": ep["episode_number"],
+        "url": cdn_url(ep["r2_key"]),
+    }
+
+
+# ═══════════════════════════════════════════════════
+# ROOT
+# ═══════════════════════════════════════════════════
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "API is running 🔥"}
+    return {"name": "Reelz API", "version": "1.0.0", "status": "online"}
+
+
+# ═══════════════════════════════════════════════════
+# FEED — CURSOR PAGINATION
+# ═══════════════════════════════════════════════════
 
 @app.get("/feed")
-def get_feed(page: int = Query(default=1, ge=1)):
+def feed(
+    cursor: str = Query(None, description="Movie ID to start after (for pagination)"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """
+    TikTok-style feed of trailers.
+    Returns movies with trailers + cursor for infinite scroll.
+    """
+    query = supabase.table("movies") \
+        .select("id,title,slug,thumbnail,trailer,created_at") \
+        .not_.is_("trailer", "null") \
+        .order("created_at", desc=True) \
+        .limit(limit + 1)  # fetch 1 extra to know if there's a next page
 
-    # How many videos to fetch total
-    total_needed = CHUNK_SIZE + (CHUNK_SIZE * PRELOAD_CHUNKS)
+    if cursor:
+        # Cursor = last seen movie ID, fetch older ones
+        query = query.lt("id", cursor)
 
-    # Get random offsets
-    offsets = get_random_offsets(total_needed)
-
-    # Fetch all at once in parallel batches
-    current_offsets = offsets[:CHUNK_SIZE]
-    preload_offsets = offsets[CHUNK_SIZE:]
-
-    # Fetch current chunk — one call per random offset
-    # Supabase doesn't support random() so we fetch by random row ranges
-    start = random.randint(0, max(0, TOTAL_VIDEOS - CHUNK_SIZE))
-    end = start + CHUNK_SIZE - 1
-
-    result = supabase.table("videos")\
-        .select("id, video_url, thumbnail_url, caption, hashtags")\
-        .range(start, end)\
-        .execute()
-
-    # Fetch preload from different random range
-    preload_start = random.randint(0, max(0, TOTAL_VIDEOS - (CHUNK_SIZE * PRELOAD_CHUNKS)))
-    preload_end = preload_start + (CHUNK_SIZE * PRELOAD_CHUNKS) - 1
-
-    preload = supabase.table("videos")\
-        .select("id, video_url, thumbnail_url")\
-        .range(preload_start, preload_end)\
-        .execute()
-
-    return {
-        "page": page,
-        "chunk_size": CHUNK_SIZE,
-        "videos": [clean_video(v) for v in result.data],
-        "preload_urls": [
-            {
-                "id": v.get("id"),
-                "video_url": swap_to_fast_url(v.get("video_url", "")),
-                "thumbnail_url": v.get("thumbnail_url"),
-            }
-            for v in preload.data
-        ],
-        "next_page": page + 1
-    }
-
-@app.get("/video/{video_id}")
-def get_video(video_id: str):
-    result = supabase.table("videos")\
-        .select("id, video_url, thumbnail_url, caption, hashtags")\
-        .eq("id", video_id)\
-        .single()\
-        .execute()
+    result = query.execute()
 
     if not result.data:
-        return {"error": "Video not found"}
+        return {"data": [], "next_cursor": None, "has_more": False}
 
-    return clean_video(result.data)
+    movies = result.data
+    has_more = len(movies) > limit
+
+    if has_more:
+        movies = movies[:limit]  # trim the extra
+
+    data = [make_movie_response(m) for m in movies]
+    next_cursor = data[-1]["id"] if has_more else None
+
+    return {
+        "data": data,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+
+
+# ═══════════════════════════════════════════════════
+# MOVIE DETAILS + EPISODES
+# ═══════════════════════════════════════════════════
+
+@app.get("/movie/{slug}")
+def movie_detail(slug: str):
+    """
+    Get movie info + all episodes sorted by episode_number.
+    App uses this when user clicks "Watch" on a trailer.
+    """
+    # Fetch movie
+    movie_result = supabase.table("movies") \
+        .select("*") \
+        .eq("slug", slug) \
+        .execute()
+
+    if not movie_result.data:
+        raise HTTPException(status_code=404, detail="Movie not found")
+
+    movie = movie_result.data[0]
+
+    # Fetch all episodes for this movie
+    episodes_result = supabase.table("episodes") \
+        .select("*") \
+        .eq("movie_id", movie["id"]) \
+        .order("episode_number", ascending=True) \
+        .execute()
+
+    episodes = [make_episode_response(ep) for ep in episodes_result.data]
+
+    return {
+        "movie": make_movie_response(movie),
+        "episodes": episodes,
+        "total_episodes": len(episodes),
+    }
+
+
+# ═══════════════════════════════════════════════════
+# EPISODE REDIRECT (INSTANT STREAM)
+# ═══════════════════════════════════════════════════
+
+@app.get("/stream/{slug}/ep{episode_number}")
+def stream_episode(slug: str, episode_number: int):
+    """
+    Redirect to CDN for instant streaming.
+    CDN handles Range requests, chunked transfer, caching.
+    """
+    # Verify movie + episode exist
+    movie = supabase.table("movies").select("id").eq("slug", slug).execute()
+    if not movie.data:
+        raise HTTPException(status_code=404, detail="Movie not found")
+
+    episode = supabase.table("episodes") \
+        .select("r2_key") \
+        .eq("movie_id", movie.data[0]["id"]) \
+        .eq("episode_number", episode_number) \
+        .execute()
+
+    if not episode.data:
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    # 302 redirect to CDN (browser streams directly from R2 CDN)
+    return RedirectResponse(
+        url=cdn_url(episode.data[0]["r2_key"]),
+        status_code=302
+    )
+
+
+# ═══════════════════════════════════════════════════
+# SEARCH
+# ═══════════════════════════════════════════════════
+
+@app.get("/search")
+def search(
+    q: str = Query(..., min_length=1, max_length=100),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """Search movies by title."""
+    result = supabase.table("movies") \
+        .select("id,title,slug,thumbnail,trailer,created_at") \
+        .ilike("title", f"%{q}%") \
+        .limit(limit) \
+        .execute()
+
+    data = [make_movie_response(m) for m in result.data]
+    return {"data": data, "total": len(data)}
+
+
+# ═══════════════════════════════════════════════════
+# HEALTH
+# ═══════════════════════════════════════════════════
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
