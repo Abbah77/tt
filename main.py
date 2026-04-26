@@ -56,7 +56,7 @@ def feed(
 ):
     q = supabase.table("movies")\
         .select("id,title,slug,thumbnail,trailer,created_at")\
-        .not_.is_("thumbnail", "null")\
+        .not_.is_("trailer", "null")\
         .order("created_at", desc=True)\
         .limit(limit + 1)
 
