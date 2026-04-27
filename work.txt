@@ -1,0 +1,547 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/theme/tokens.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Your design system — single source of truth for entire app.
+
+RColors   → all colors used in app
+            brand     = #0090FF (electric blue)
+            brand2    = #00D4FF (cyan)
+            like      = #FF3B5C (red for like button)
+            bg        = #050508 (near black background)
+            glass     = white with low opacity (glass effect)
+            text/text2/text3/text4 = white with decreasing opacity
+
+RText     → all font styles
+            wordmark() = Space Grotesk bold (Reelz logo)
+            body()     = Plus Jakarta Sans (all regular text)
+            label()    = Plus Jakarta Sans small (button labels)
+
+RDur      → animation durations
+            xs=80ms, sm=160ms, md=280ms, lg=420ms
+
+RCurve    → animation curves
+            spring = bouncy feel
+            easeOut = smooth deceleration
+            ios = Apple-like feel
+
+CHANGE HERE IF:
+→ Changing brand color
+→ Changing any font
+→ Adjusting animation speed globally
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/models/models.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Data structures that mirror your API responses exactly.
+
+MovieCard     → one movie in the feed
+                id, title, slug, thumbnailUrl, trailerUrl
+                fromJson() maps API response fields
+
+EpisodeModel  → one episode of a movie
+                id, number, url (R2 CDN link)
+
+MovieDetail   → full movie response from /movie/{slug}
+                contains MovieCard + List<EpisodeModel>
+
+FeedResponse  → response from /feed endpoint
+                data (list of MovieCards)
+                nextCursor (for pagination)
+                hasMore (bool)
+
+CHANGE HERE IF:
+→ Backend API adds new fields
+→ Field names change in API response
+→ New model needed for new feature
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/services/api_service.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All HTTP calls to your FastAPI backend. One place for all API logic.
+
+_base         → your backend URL (Render)
+_dio          → HTTP client with 12s timeout + gzip compression
+
+getFeed()     → GET /feed?cursor=&limit=
+               returns FeedResponse (paginated movie list)
+
+getMovie()    → GET /movie/{slug}
+               returns MovieDetail (movie + all episodes)
+
+search()      → GET /search?q=
+               returns List<MovieCard>
+
+CHANGE HERE IF:
+→ Backend URL changes (change _base)
+→ New endpoint added
+→ Timeout needs adjusting
+→ Headers need changing
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/controllers/settings_controller.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Global app settings stored in memory. Provided at app root in main.dart.
+
+autoNext  → bool: auto play next episode when current finishes
+quality   → string: video quality preference (Auto/1080p/720p/480p)
+
+Setters notify all listeners automatically.
+
+Used by:
+→ PlayerScreen tools drawer (toggle autoNext on/off)
+→ SettingsScreen (display and change both settings)
+→ PlayerController (reads autoNext to decide auto play)
+
+CHANGE HERE IF:
+→ Adding new setting (add variable + setter)
+→ Persisting settings to device storage (add SharedPreferences)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/controllers/feed_controller.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Brain of the FOR YOU feed. Manages trailers + pagination.
+
+State:
+_movies       → list of MovieCards from API
+_players      → Map<index, Player> one player per trailer
+_currentIndex → which card user is currently on
+_nextCursor   → cursor for next page of movies
+_hasMore      → whether more movies exist on server
+
+Key methods:
+init()           → fetches first page, inits first 2 trailers, plays index 0
+onPageChanged()  → pauses previous, plays current, preloads next 2, cleans far
+_initTrailer()   → creates Player, opens trailer URL, sets loop
+_cleanup()       → disposes players more than 4 away from current (memory management)
+_fetchMore()     → fetches next page when near end of list
+refresh()        → clears everything and restarts (pull to refresh)
+togglePlay()     → pause/resume trailer at given index
+
+Buffer size: 16MB per trailer (small — trailers are short)
+
+CHANGE HERE IF:
+→ Changing preload count (for loop: i <= 2)
+→ Changing fetch limit (limit: 10)
+→ Changing cleanup distance (abs() > 4)
+→ Changing buffer size (bufferSize: 16 * 1024 * 1024)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/controllers/player_controller.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Full cinema player brain. Most complex controller.
+
+State:
+_player          → media_kit Player instance (64MB buffer)
+_currentEp       → current episode index
+_isLandscape     → whether screen is rotated
+_showControls    → whether controls are visible
+_isLocked        → screen locked (no touch except long press)
+_showDrawer      → episode drawer open/closed
+_showToolsDrawer → tools drawer open/closed
+_speed           → playback speed (0.5x to 2x)
+_position        → current playback position
+_duration        → total duration of current episode
+_isBuffering     → buffering indicator
+_videoAspectRatio → detected from actual video stream
+_isVerticalVideo  → true if aspect ratio < 1.0
+
+init():
+→ enables wakelock (screen stays on)
+→ opens first episode URL
+→ listens to videoParams stream (detects aspect ratio)
+→ listens to position stream (updates seek bar)
+→ listens to duration stream (updates time label)
+→ listens to buffering stream (shows spinner)
+→ listens to completed stream (auto next episode)
+
+playEpisode(index):
+→ opens new R2 URL for that episode
+→ resets position/duration
+→ starts playing immediately
+
+Key methods:
+togglePlayPause()    → play or pause
+seekRelative(secs)   → jump ±10 seconds
+seekProgress(0.0-1.0) → seek bar position
+setSpeed(double)     → change playback speed
+toggleOrientation()  → rotate portrait/landscape
+toggleLock()         → lock/unlock screen
+skipIntro()          → jump to 90 seconds
+toggleDrawer()       → open/close episode list
+toggleToolsDrawer()  → open/close tools menu
+showControlsTemporary() → show controls then auto hide after 4s
+
+dispose():
+→ disables wakelock
+→ resets orientation to portrait
+→ disposes player
+
+CHANGE HERE IF:
+→ Changing buffer size (bufferSize: 32 * 1024 * 1024)
+→ Changing auto-hide delay (Duration(seconds: 4))
+→ Changing skip intro time (Duration(seconds: 90))
+→ Adding new tool (add method + notifyListeners)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/widgets/ambient_bg.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Animated background shown behind the feed.
+
+What it draws:
+→ Orb 1: brand blue, top-right area, slowly drifting
+→ Orb 2: cyan brand2, bottom-left area, slowly drifting
+→ 600 grain dots across entire screen (subtle texture)
+
+Animation: 10 second loop, reverses direction
+Uses sine/cosine math to move orbs smoothly
+
+CHANGE HERE IF:
+→ Changing orb colors (RColors.brand / RColors.brand2)
+→ Making animation faster (Duration(seconds: 10))
+→ Removing grain (delete the grain loop)
+→ Adding more orbs (add more canvas.drawCircle calls)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/widgets/feed_card.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+One full-screen card in the FOR YOU vertical feed.
+
+Layers (bottom to top):
+1. Thumbnail → CachedNetworkImage from R2 (shows instantly)
+2. Trailer   → Video widget overlays thumbnail when ready
+3. Bottom gradient → dark fade for text readability
+4. Top gradient    → dark fade for top bar readability
+5. Play/pause flash → appears briefly on tap
+6. Right side actions → Like, Share, Save buttons
+7. Bottom info → title + Watch Episode 1 glowing button
+
+_bind():
+→ gets Player from FeedController at this index
+→ creates VideoController from that Player
+→ called on init and didUpdateWidget
+
+_onTap():
+→ toggles play/pause via FeedController
+→ shows play/pause icon briefly
+
+_goToPlayer():
+→ pauses current trailer
+→ calls ApiService.getMovie(slug) to get real episodes
+→ creates PlayerController with those episodes
+→ pushes PlayerScreen with hero zoom transition
+→ shows SnackBar if movie fails to load
+
+_ActionBtn:
+→ glass morphism circle button
+→ press animation (scale down to 0.84)
+→ glow effect when active (liked/saved)
+
+CHANGE HERE IF:
+→ Adding new action button (add _ActionBtn to right Column)
+→ Changing Watch button text or style
+→ Changing transition duration/style
+→ Changing thumbnail fit (BoxFit.cover)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/screens/feed_screen.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Main app shell. Contains 5 components:
+
+FeedScreen:
+→ Creates FeedController and provides it to widget tree
+→ IndexedStack keeps all 3 screens alive (no rebuild on tab switch)
+→ Always shows bottom nav
+
+_FeedView:
+→ Vertical PageView.builder (TikTok scroll)
+→ PageScrollPhysics = one snap per swipe, no bounce
+→ Each page = one FeedCard
+→ RefreshIndicator = pull down to refresh
+
+_TopBar:
+→ "Reelz" wordmark left
+→ Search icon right (glass button)
+→ No tabs, no Following/For You
+
+_BottomNav:
+→ 3 tabs only: Home, Explore, Profile
+→ Glass morphism background with blur
+→ Active tab = brand blue, inactive = grey
+→ Haptic feedback on tap
+
+_FeedSkeleton:
+→ Shimmer loading state
+→ Positions match exact real UI positions
+→ Actions skeleton right side at bottom:110
+→ Title + button skeleton left side at bottom:100
+
+_ErrorView:
+→ Shows when API fails and no movies loaded
+→ Retry button calls controller.refresh()
+
+CHANGE HERE IF:
+→ Adding 4th nav tab (add to IndexedStack + _BottomNav)
+→ Changing skeleton positions (must match real UI)
+→ Changing scroll physics
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/screens/player_screen.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Full cinema player. Most complex screen. 8 components:
+
+PlayerScreen:
+→ Creates VideoController from PlayerController.player
+→ Uses OrientationBuilder to detect device rotation
+→ Long press → opens tools drawer
+→ Tap → toggle controls
+
+_VideoArea:
+→ Decides how video fills screen based on aspect ratio
+→ Landscape device        → AspectRatio + BoxFit.contain
+→ Portrait + vertical vid  → BoxFit.cover (fills screen like TikTok)
+→ Portrait + horizontal vid → Column with black bars top/bottom
+   video centered in middle
+
+_PortraitControls (portrait device):
+→ Top bar: back button + title + fullscreen icon
+→ Double tap left zone  → seek -10s
+→ Double tap right zone → seek +10s
+→ Center: play/pause button (glass morphism)
+→ Right side: Like, Share, Save (same as feed)
+→ Bottom bar: time labels + EP indicator + seek bar + buttons row
+
+_LandscapeControls (landscape device):
+→ Top: back to portrait button + title + EP pill
+→ Double tap zones + center play/pause
+→ Bottom: time + EP button + seek bar only
+→ No action buttons in landscape (clean MX player style)
+
+_SeekBar:
+→ Slider mapped to progress (0.0 to 1.0)
+→ Blue active track, white thumb
+→ Shows controls temporarily when dragged
+
+_EpisodeDrawer (swipe up):
+→ Glass morphism bottom sheet
+→ GridView of REAL episode numbers from API
+→ 5 columns grid
+→ Current episode highlighted blue with glow
+→ Tap episode → playEpisode(index) + close drawer
+→ Video keeps playing behind drawer
+
+_ToolsDrawer (long press):
+→ Speed selector: 0.5x 0.75x 1x 1.25x 1.5x 2x
+→ Brightness slider
+→ Tool buttons: Rotate, Lock, Skip Intro, Auto Next toggle
+
+CHANGE HERE IF:
+→ Adding control button (add to _PortraitControls bottom row)
+→ Changing episode grid columns (crossAxisCount: 5)
+→ Changing speed options (speeds list)
+→ Adjusting black bar ratio for horizontal videos (flex values)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/screens/explore_screen.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Search and discovery page.
+
+States:
+→ Empty (default)    → shows _Trending (movies from feed)
+→ Searching          → shows spinner
+→ Results found      → shows _Grid
+→ No results         → shows _EmptySearch
+
+Search logic:
+→ Calls ApiService.search(query) on your backend
+→ Falls back to filtering local feed movies if API fails
+→ Searches on every keystroke (onChanged)
+
+_Trending:
+→ Takes movies already loaded in FeedController
+→ Shows them in 2-column grid
+→ No extra API call needed
+
+_Grid:
+→ 2 column GridView
+→ childAspectRatio: 0.65 (portrait poster shape)
+→ Each item = _Poster widget
+
+_Poster:
+→ Thumbnail from R2
+→ Dark gradient bottom for title readability
+→ Long press → scale down + play icon overlay
+→ Tap → ApiService.getMovie(slug) → PlayerScreen
+
+CHANGE HERE IF:
+→ Changing grid columns (crossAxisCount: 2)
+→ Changing poster aspect ratio (childAspectRatio: 0.65)
+→ Adding category filters above grid
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/screens/profile_screen.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Profile page + Settings screen.
+
+ProfileScreen:
+→ Avatar circle (blue gradient with "R" initial)
+→ Username + handle text below avatar
+→ Saved/Liked stats row
+→ Settings icon top right → opens SettingsScreen
+→ Empty saved placeholder (connect real data later)
+
+SettingsScreen:
+→ Auto Next Episode toggle (SettingsController.autoNext)
+→ Video Quality picker (SettingsController.quality)
+→ About/Privacy/Terms/Clear Cache (wire up logic later)
+→ App version at bottom
+
+_Toggle widget → switch row with icon + label + subtitle
+_Tap widget    → arrow row for navigation items
+_Picker widget → shows bottom sheet with options list
+
+CHANGE HERE IF:
+→ Adding real user auth (replace avatar with profile photo)
+→ Connecting saved videos (replace empty state with grid)
+→ Adding new setting (add _Toggle or _Picker)
+→ Wiring up About/Privacy links
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 lib/main.dart
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+App entry point. Runs first on launch.
+
+→ Initializes media_kit (MUST be before runApp)
+→ Locks orientation to portrait
+→ Sets transparent status bar + nav bar
+→ Provides SettingsController globally via MultiProvider
+→ Launches ReelzApp → MaterialApp → FeedScreen
+
+CHANGE HERE IF:
+→ Adding new global provider (add to MultiProvider)
+→ Changing app name (title: 'Reelz')
+→ Allowing landscape on launch (remove setPreferredOrientations)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 pubspec.yaml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Dependencies:
+
+media_kit + media_kit_video + media_kit_libs_video
+→ Video player. Hardware accelerated. Fastest available.
+→ Supports network streams, looping, speed control
+
+dio
+→ HTTP client for all API calls
+→ Faster than http package, supports interceptors
+
+cached_network_image
+→ Downloads thumbnails once and caches to device
+→ Shows placeholder while loading
+
+provider
+→ State management
+→ ChangeNotifierProvider for all controllers
+
+flutter_animate
+→ All animations (shimmer, fadeIn, slideX, scale, boxShadow)
+
+google_fonts
+→ Space Grotesk (wordmark) + Plus Jakarta Sans (body)
+
+screen_brightness
+→ Brightness slider in player tools drawer
+
+wakelock_plus
+→ Prevents screen from sleeping during video playback
+
+CHANGE HERE IF:
+→ Adding new package (add under dependencies)
+→ Upgrading package version
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 .github/workflows/build.yml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Auto builds APK on every push to main/master branch.
+
+Steps:
+1. Checkout code from GitHub
+2. Setup Java 17 (required by Flutter for Android)
+3. Setup Flutter 3.22.0 stable
+4. flutter pub get (install dependencies)
+5. flutter build apk --release --split-per-abi
+6. Upload APKs as downloadable artifact (7 days)
+
+--split-per-abi generates 3 APKs:
+→ arm64-v8a   ← use this (all modern Android phones)
+→ armeabi-v7a ← older phones
+→ x86_64      ← emulators only
+
+Download from: GitHub → Actions tab → latest run → Artifacts
+
+CHANGE HERE IF:
+→ Upgrading Flutter version
+→ Changing artifact retention days
+→ Adding iOS build (needs macOS runner)
+→ Adding automated testing step
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW ALL FILES CONNECT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+main.dart
+└── provides SettingsController globally
+└── launches FeedScreen
+
+FeedScreen
+└── creates + provides FeedController
+└── IndexedStack → Feed | Explore | Profile
+
+FeedController
+└── calls ApiService.getFeed()
+└── creates Player per trailer URL
+└── provides Player to FeedCard via getPlayer()
+
+FeedCard
+└── reads Player from FeedController → VideoController
+└── shows thumbnail + trailer
+└── on tap Watch → ApiService.getMovie(slug)
+└── creates PlayerController with real episodes
+└── pushes PlayerScreen
+
+PlayerController
+└── opens episode URLs from R2
+└── detects aspect ratio from stream
+└── auto next via stream.completed
+└── reads SettingsController.autoNext
+
+PlayerScreen
+└── reads PlayerController
+└── reads SettingsController
+└── _VideoArea decides vertical/horizontal layout
+└── _EpisodeDrawer shows real episodes from controller
+└── _ToolsDrawer reads/writes both controllers
+
+ExploreScreen
+└── calls ApiService.search()
+└── reads FeedController.movies for trending
+└── on tap → ApiService.getMovie() → PlayerScreen
+
+ProfileScreen
+└── reads/writes SettingsController
+└── shows static profile (connect real auth later)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
