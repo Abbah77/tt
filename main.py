@@ -1,13 +1,16 @@
+import os
+import math
+import urllib.parse
+import requests
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
-from supabase import create_client
-import os
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Reelz API", version="2.0.0")
+app = FastAPI(title="Reelz Sniper API", version="3.0.0")
 
-app.add_middleware(GZipMiddleware, minimum_size=500)
+# High-velocity response compression network layers
+app.add_middleware(GZipMiddleware, minimum_size=256)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,124 +18,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-CDN = os.getenv("CDN_BASE", "https://reelz.dpdns.org")
+# Production Configuration Variables
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "YOUR_WORKING_TMDB_KEY")
+STREAM_BASE = "https://vidlink.pro"
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-def cdn(key):
-    return f"{CDN}/{key}" if key else None
-
-def movie_json(m):
+def sniper_movie_mapping(m):
+    """
+    Transforms global metadata into your instant TikTok-feed layout.
+    Injects the direct trailer stream vector as Key 3 so your frontend 
+    can autoplay it immediately when scrolling.
+    """
+    movie_id = m.get("id")
+    poster = m.get("poster_path")
+    
     return {
-        "id": m["id"],
-        "title": m["title"],
-        "slug": m["slug"],
-        "thumbnail_url": cdn(m.get("thumbnail")),
-        "trailer_url": cdn(m.get("trailer")),
-        "created_at": str(m.get("created_at", "")),
-    }
-
-def ep_json(e):
-    return {
-        "id": e["id"],
-        "episode_number": e["episode_number"],
-        "url": cdn(e["r2_key"]),
+        "id": movie_id,
+        "title": m.get("title") or m.get("original_title") or "Untitled",
+        "slug": str(movie_id),
+        "thumbnail_url": f"https://image.tmdb.org/t/p/w500{poster}" if poster else "https://images.unsplash.com/photo-1440404653325-ab127d49abc1?q=80&w=500",
+        "trailer_url": f"{STREAM_BASE}/trailer/{movie_id}", # Key 3: Instant TikTok background engine
     }
 
 @app.get("/")
 def root():
-    return {"status": "online", "name": "Reelz API", "version": "2.0.0"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    return {"status": "online", "engine": "High-Speed Sniper v3"}
 
 @app.get("/feed")
-def feed(
-    cursor: int = Query(None),
-    limit: int = Query(10, ge=1, le=50),
-):
-    q = supabase.table("movies")\
-        .select("id,title,slug,thumbnail,trailer,created_at")\
-        .not_.is_("trailer", "null")\
-        .order("created_at", desc=True)\
-        .limit(limit + 1)
-
-    if cursor:
-        q = q.lt("id", cursor)
-
-    rows = q.execute().data
-    has_more = len(rows) > limit
-    if has_more:
-        rows = rows[:limit]
-
-    response = JSONResponse(content={
-        "data": [movie_json(r) for r in rows],
-        "next_cursor": rows[-1]["id"] if has_more else None,
-        "has_more": has_more,
-    })
-    response.headers["Cache-Control"] = "public, max-age=30"
-    return response
+def feed(page: int = Query(1, ge=1)):
+    """High-velocity discovery array feeding your main application loop"""
+    url = f"https://api.themoviedb.org/3/discover/movie?api_key={TMDB_API_KEY}&sort_by=popularity.desc&page={page}"
+    try:
+        response = requests.get(url, timeout=4).json()
+        rows = response.get("results", [])
+        
+        return JSONResponse(content={
+            "data": [sniper_movie_mapping(r) for r in rows],
+            "next_page": page + 1 if len(rows) > 0 else None,
+            "has_more": len(rows) > 0
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sniper feed failure: {str(e)}")
 
 @app.get("/movie/{slug}")
 def movie(slug: str):
-    mv = supabase.table("movies")\
-        .select("*")\
-        .eq("slug", slug)\
-        .execute()
+    """
+    The Core Sniper Calculation Engine.
+    Simulates your old pre-split bucket architecture by using pure chronology math.
+    """
+    try:
+        # Pull core structural properties directly from worldwide asset registers
+        tmdb_url = f"https://api.themoviedb.org/3/movie/{slug}?api_key={TMDB_API_KEY}"
+        movie_info = requests.get(tmdb_url, timeout=4).json()
+        
+        if "status_code" in movie_info and movie_info["status_code"] == 34:
+            raise HTTPException(status_code=404, detail="Target asset missing from global registry")
+            
+        runtime = movie_info.get("runtime", 120)  # Safe execution fallback fallback
+        master_stream = f"{STREAM_BASE}/movie/{slug}" # Key 4: Master file layout target
 
-    if not mv.data:
-        raise HTTPException(status_code=404, detail="Movie not found")
+        # HIGH-SPEED CHRONOLOGICAL SLICING MATRIX
+        # Instantly segments any full-length film into virtual 5-minute chunks in server memory
+        episode_length_mins = 5
+        total_episodes = math.ceil(runtime / episode_length_mins)
+        episodes_list = []
+        
+        for i in range(1, total_episodes + 1):
+            start_seconds = (i - 1) * episode_length_mins * 60
+            episodes_list.append({
+                "id": i,
+                "episode_number": i,
+                "url": master_stream,        # Raw stream endpoint for extraction
+                "seek_seconds": start_seconds # Precise playback anchor offset
+            })
 
-    m = mv.data[0]
-
-    eps = supabase.table("episodes")\
-        .select("*")\
-        .eq("movie_id", m["id"])\
-        .order("episode_number")\
-        .execute()
-
-    return {
-        "movie": movie_json(m),
-        "episodes": [ep_json(e) for e in eps.data],
-        "total_episodes": len(eps.data),
-    }
-
-@app.get("/stream/{slug}/ep{ep}")
-def stream(slug: str, ep: int):
-    mv = supabase.table("movies")\
-        .select("id")\
-        .eq("slug", slug)\
-        .execute()
-
-    if not mv.data:
-        raise HTTPException(status_code=404, detail="Movie not found")
-
-    ep_data = supabase.table("episodes")\
-        .select("r2_key")\
-        .eq("movie_id", mv.data[0]["id"])\
-        .eq("episode_number", ep)\
-        .execute()
-
-    if not ep_data.data:
-        raise HTTPException(status_code=404, detail="Episode not found")
-
-    return RedirectResponse(
-        cdn(ep_data.data[0]["r2_key"]),
-        status_code=302,
-    )
+        return {
+            "movie": sniper_movie_mapping(movie_info),
+            "episodes": episodes_list,
+            "total_episodes": total_episodes,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sniper mapping failure: {str(e)}")
 
 @app.get("/search")
-def search(
-    q: str = Query(..., min_length=1),
-    limit: int = Query(10, ge=1, le=50),
-):
-    rows = supabase.table("movies")\
-        .select("id,title,slug,thumbnail,trailer")\
-        .ilike("title", f"%{q}%")\
-        .limit(limit)\
-        .execute()
-
-    return {"data": [movie_json(r) for r in rows.data]}
+def search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
+    """Instant text query search vector querying global asset networks"""
+    url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={urllib.parse.quote(q)}&page={page}"
+    try:
+        response = requests.get(url, timeout=4).json()
+        rows = response.get("results", [])
+        return {"data": [sniper_movie_mapping(r) for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
