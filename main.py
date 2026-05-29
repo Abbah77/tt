@@ -6,6 +6,11 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# Load environment variables from .env file immediately on boot
+load_dotenv()
 
 app = FastAPI(title="Reelz Sniper API", version="3.0.0")
 
@@ -18,9 +23,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Production Configuration Variables
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "YOUR_WORKING_TMDB_KEY")
+# Configuration Variables
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 STREAM_BASE = "https://vidlink.pro"
+
+# Optional: Initialize Supabase client if credentials exist in your environment
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        print(f"Warning: Supabase client initialization failed: {e}")
 
 def sniper_movie_mapping(m):
     """
@@ -46,6 +62,9 @@ def root():
 @app.get("/feed")
 def feed(page: int = Query(1, ge=1)):
     """High-velocity discovery array feeding your main application loop"""
+    if not TMDB_API_KEY:
+        raise HTTPException(status_code=500, detail="TMDB API Key missing from environment configurations.")
+        
     url = f"https://api.themoviedb.org/3/discover/movie?api_key={TMDB_API_KEY}&sort_by=popularity.desc&page={page}"
     try:
         response = requests.get(url, timeout=4).json()
@@ -57,7 +76,7 @@ def feed(page: int = Query(1, ge=1)):
             "has_more": len(rows) > 0
         })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Sniper feed failure: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Feed sniper failure: {str(e)}")
 
 @app.get("/movie/{slug}")
 def movie(slug: str):
@@ -65,6 +84,9 @@ def movie(slug: str):
     The Core Sniper Calculation Engine.
     Simulates your old pre-split bucket architecture by using pure chronology math.
     """
+    if not TMDB_API_KEY:
+        raise HTTPException(status_code=500, detail="TMDB API Key missing from environment configurations.")
+
     try:
         # Pull core structural properties directly from worldwide asset registers
         tmdb_url = f"https://api.themoviedb.org/3/movie/{slug}?api_key={TMDB_API_KEY}"
@@ -73,7 +95,7 @@ def movie(slug: str):
         if "status_code" in movie_info and movie_info["status_code"] == 34:
             raise HTTPException(status_code=404, detail="Target asset missing from global registry")
             
-        runtime = movie_info.get("runtime", 120)  # Safe execution fallback fallback
+        runtime = movie_info.get("runtime", 120)  # Safe execution fallback
         master_stream = f"{STREAM_BASE}/movie/{slug}" # Key 4: Master file layout target
 
         # HIGH-SPEED CHRONOLOGICAL SLICING MATRIX
@@ -102,6 +124,9 @@ def movie(slug: str):
 @app.get("/search")
 def search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
     """Instant text query search vector querying global asset networks"""
+    if not TMDB_API_KEY:
+        raise HTTPException(status_code=500, detail="TMDB API Key missing from environment configurations.")
+
     url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={urllib.parse.quote(q)}&page={page}"
     try:
         response = requests.get(url, timeout=4).json()
