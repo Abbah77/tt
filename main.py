@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 # Configuration Variables
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+TMDB_API_KEY = os.getenv("1eef1496d59aa06f62e201ddce2741b4")
 STREAM_BASE = "https://vidlink.pro"
 
 # Optional: Initialize Supabase client if credentials exist in your environment
