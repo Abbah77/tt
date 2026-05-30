@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file immediately on boot
 load_dotenv()
 
-app = FastAPI(title="Reelz Master Sniper API", version="9.0.0")
+app = FastAPI(title="Reelz Native Scraper API", version="10.0.0")
 
 # High-velocity response compression network layers
 app.add_middleware(GZipMiddleware, minimum_size=256)
@@ -38,7 +38,7 @@ def sniper_movie_mapping(m):
 
 @app.get("/")
 def root():
-    return {"status": "online", "engine": "Master Dynamic Streaming Engine v9.0"}
+    return {"status": "online", "engine": "Direct Multi-Source Scraper Engine v10.0"}
 
 @app.get("/feed")
 def feed(page: int = Query(1, ge=1)):
@@ -62,7 +62,7 @@ def feed(page: int = Query(1, ge=1)):
 def movie(slug: str):
     """
     The Core Sniper Matrix.
-    Maps out the precise episodic data arrays for your frontend.
+    Calculates episodic splits and passes absolute proxy URLs.
     """
     if not TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="Configuration Key missing: TMDB_API_KEY")
@@ -103,8 +103,9 @@ def movie(slug: str):
 @app.get("/api/stream/{slug}/ep{ep}")
 def stream_resolver(slug: str, ep: int):
     """
-    The Master Multi-Source Stream Router.
-    Targets open-source CDN endpoint aggregators that allow native tracking embeds.
+    The Extraction Core.
+    Queries an open-source stream scraper to extract raw, unblocked media files 
+    and redirects the native Flutter player right to the direct .m3u8 play target.
     """
     try:
         # Step 1: TMDB ID -> IMDb ID conversion
@@ -117,15 +118,26 @@ def stream_resolver(slug: str, ep: int):
             ext_data = requests.get(ext_url, timeout=3).json()
             imdb_id = ext_data.get("imdb_id") or f"tt{slug}"
 
-        # Step 2: Use an unblocked, high-speed open CDN source resolver vector
-        # This pipeline passes standard direct playable formats cleanly
-        vidsrc_cc_api = f"https://vidsrc.cc/v2/embed/movie/{imdb_id}"
+        # Step 2: Query an open source streamer scraper pipeline
+        # Pulls direct media sources without proxy/HTML wrapper elements
+        scraper_api_url = f"https://vidsrc-api-one.vercel.app/api/movie/{imdb_id}"
         
-        # Validate that the link resolves and redirect your native player straight to the target stream stream
-        return RedirectResponse(url=vidsrc_cc_api, status_code=302)
+        headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"}
+        response = requests.get(scraper_api_url, headers=headers, timeout=5).json()
+        
+        # Look for direct stream array tracks
+        sources = response.get("sources", [])
+        if sources and len(sources) > 0:
+            direct_m3u8_url = sources[0].get("url")
+            if direct_m3u8_url:
+                # Redirects your native player straight to the raw video path target
+                return RedirectResponse(url=direct_m3u8_url, status_code=302)
+
+        # Emergency Fallback Loop
+        fallback_video = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+        return RedirectResponse(url=fallback_video, status_code=302)
 
     except Exception as e:
-        # Secure fallback tracking loops
         fallback_video = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
         return RedirectResponse(url=fallback_video, status_code=302)
 
