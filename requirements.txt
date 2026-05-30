@@ -1,5 +1,8 @@
-fastapi
-uvicorn
-supabase
-python-dotenv
-requests
+fastapi==0.110.0
+uvicorn==0.28.0
+gunicorn==21.2.0
+uvloop==0.19.0; sys_platform != 'win32'
+requests==2.31.0
+python-dotenv==1.0.1
+h11==0.14.0
+
