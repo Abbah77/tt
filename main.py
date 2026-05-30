@@ -5,13 +5,13 @@ import requests
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 
 # Load environment variables from .env file immediately on boot
 load_dotenv()
 
-app = FastAPI(title="Reelz Wise Handshake API", version="7.0.0")
+app = FastAPI(title="Reelz Native Proxy API", version="8.0.0")
 
 # High-velocity streaming compression network configurations
 app.add_middleware(GZipMiddleware, minimum_size=256)
@@ -38,7 +38,7 @@ def sniper_movie_mapping(m):
 
 @app.get("/")
 def root():
-    return {"status": "online", "engine": "Server-Side Handshake Gateway v7.0"}
+    return {"status": "online", "engine": "Direct Stream Proxy Engine v8.0"}
 
 @app.get("/feed")
 def feed(page: int = Query(1, ge=1)):
@@ -62,8 +62,8 @@ def feed(page: int = Query(1, ge=1)):
 def movie(slug: str):
     """
     The Core Sniper Matrix.
-    Points the final episode stream URLs back to our intelligent API endpoint.
-    Flutter changes nothing; it just calls this endpoint like it always has.
+    Pipes streaming URLs directly back to our server proxy.
+    Flutter reads this as a normal data link, completely native.
     """
     if not TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="Configuration Key missing: TMDB_API_KEY")
@@ -77,12 +77,10 @@ def movie(slug: str):
             
         runtime = movie_info.get("runtime", 120)  
         
-        # High-speed chronological slicing loop (5-minute segments)
         episode_length_mins = 5
         total_episodes = math.ceil(runtime / episode_length_mins)
         episodes_list = []
         
-        # Pull your real domain dynamically or use your absolute deployment URL
         PRODUCTION_DOMAIN = "https://tt-b577.onrender.com"
         
         for i in range(1, total_episodes + 1):
@@ -90,7 +88,9 @@ def movie(slug: str):
             episodes_list.append({
                 "id": i,
                 "episode_number": i,
-                "url": f"{PRODUCTION_DOMAIN}/api/stream/{slug}/ep{i}", 
+                # Appends a pseudo-extension (.mp4) so the native Flutter video player
+                # recognizes it instantly as a valid playable media target
+                "url": f"{PRODUCTION_DOMAIN}/api/stream/{slug}/ep{i}/video.mp4", 
                 "seek_seconds": start_seconds
             })
 
@@ -102,14 +102,16 @@ def movie(slug: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sniper gateway failure: {str(e)}")
 
-@app.get("/api/stream/{slug}/ep{ep}")
-def stream_resolver(slug: str, ep: int):
+@app.get("/api/stream/{slug}/ep{ep}/video.mp4")
+def stream_proxy(slug: str, ep: int):
     """
-    The Live Server Handshake Engine.
-    Intercepts Flutter's request, securely handles the API handshake with VidLink,
-    extracts the raw working video file link, and throws a 302 redirect.
-    Your native Flutter video player follows the redirect seamlessly!
+    The Live Stream Proxy Pipeline.
+    Intercepts Flutter's request, resolves the source target, 
+    and pipes raw stream bytes directly back to the app without redirects.
     """
+    fallback_video = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+    video_source_url = fallback_video
+
     try:
         # Step 1: TMDB ID -> IMDb ID conversion
         lookup_url = f"https://api.themoviedb.org/3/movie/{slug}?api_key={TMDB_API_KEY}"
@@ -121,33 +123,31 @@ def stream_resolver(slug: str, ep: int):
             ext_data = requests.get(ext_url, timeout=3).json()
             imdb_id = ext_data.get("imdb_id") or f"tt{slug}"
 
-        # Step 2: Query the hidden provider API directly using spoofed device credentials
+        # Step 2: Grab the direct file location from the streaming network provider
         vidlink_api_endpoint = f"https://vidlink.pro/api/movie/{imdb_id}"
         spoofed_headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://vidlink.pro/",
-            "Accept": "application/json"
         }
         
-        try:
-            api_response = requests.get(vidlink_api_endpoint, headers=spoofed_headers, timeout=4).json()
-            raw_video_url = api_response.get("stream_url")
-            
-            # If we successfully extracted the clean native .m3u8/.mp4 stream link, hand it off!
-            if raw_video_url:
-                return RedirectResponse(url=raw_video_url, status_code=302)
-        except Exception as api_err:
-            print(f"Provider API Handshake failed internally: {api_err}")
-            pass
-
-        # EMERGENCY FALLBACK TRACK: If the provider goes down, play the test track 
-        # so your native interface never hangs or errors out on a black screen.
-        fallback_video = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-        return RedirectResponse(url=fallback_video, status_code=302)
+        api_response = requests.get(vidlink_api_endpoint, headers=spoofed_headers, timeout=4).json()
+        raw_video_url = api_response.get("stream_url")
+        
+        if raw_video_url:
+            video_source_url = raw_video_url
 
     except Exception as e:
-        fallback_video = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-        return RedirectResponse(url=fallback_video, status_code=302)
+        print(f"Proxy link mapping falling back: {e}")
+        pass
+
+    # Step 3: Stream bytes directly down the pipe into Flutter
+    def video_stream_generator():
+        with requests.get(video_source_url, stream=True, timeout=10) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=1024 * 64): # High-speed 64KB chunks
+                yield chunk
+
+    return StreamingResponse(video_stream_generator(), media_type="video/mp4")
 
 @app.get("/search")
 def search(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
