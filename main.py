@@ -9,15 +9,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from dotenv import load_dotenv
 
-# Try loading uvloop for high-velocity event loops on Render's Linux environment
-if sys.platform != 'win32':
-    try:
-        import uvloop
-        uvloop.install()
-    except ImportError:
-        pass
-
-# Load environment variables on local boot (Render reads them from Dashboard settings)
+# Load environment variables on local boot
 load_dotenv()
 
 app = FastAPI(title="Reelz Wise Handshake API", version="7.0.0")
