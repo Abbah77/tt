@@ -76,16 +76,19 @@ def feed(page: int = Query(1, ge=1)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Feed sniper failure: {str(e)}")
 
+
 @app.get("/movie/{slug}")
 def movie(slug: str):
     """
     The Core Sniper Calculation Engine.
-    Keeps everything running on your 5-minute custom episodic split math.
+    Generates ABSOLUTE URLs so the Flutter native video player 
+    can target our server stream resolver directly.
     """
     if not TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="TMDB API Key missing from environment configurations.")
 
     try:
+        # Pull core structural properties directly from worldwide asset registers
         tmdb_url = f"https://api.themoviedb.org/3/movie/{slug}?api_key={TMDB_API_KEY}"
         movie_info = requests.get(tmdb_url, timeout=4).json()
         
@@ -99,12 +102,16 @@ def movie(slug: str):
         total_episodes = math.ceil(runtime / episode_length_mins)
         episodes_list = []
         
+        # Hardcode your production domain here so the player knows exactly where to go online
+        PRODUCTION_DOMAIN = "https://tt-b577.onrender.com"
+        
         for i in range(1, total_episodes + 1):
             start_seconds = (i - 1) * episode_length_mins * 60
             episodes_list.append({
                 "id": i,
                 "episode_number": i,
-                "url": f"/api/stream/{slug}/ep{i}", 
+                # FIXED: Changed from relative to absolute URL string
+                "url": f"{PRODUCTION_DOMAIN}/api/stream/{slug}/ep{i}", 
                 "seek_seconds": start_seconds
             })
 
@@ -115,6 +122,7 @@ def movie(slug: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sniper mapping failure: {str(e)}")
+
 
 @app.get("/api/stream/{slug}/ep{ep}")
 def stream_resolver(slug: str, ep: int):
