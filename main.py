@@ -12,7 +12,7 @@ from supabase import create_client, Client
 # Load environment variables from .env file immediately on boot
 load_dotenv()
 
-app = FastAPI(title="Reelz Sniper API", version="3.5.0")
+app = FastAPI(title="Reelz Sniper API", version="3.6.0")
 
 # High-velocity response compression network layers
 app.add_middleware(GZipMiddleware, minimum_size=256)
@@ -41,8 +41,6 @@ if SUPABASE_URL and SUPABASE_KEY:
 def sniper_movie_mapping(m):
     """
     Transforms global metadata into your instant TikTok-feed layout.
-    Injects the direct trailer stream vector as Key 3 so your frontend 
-    can autoplay it immediately when scrolling.
     """
     movie_id = m.get("id")
     poster = m.get("poster_path")
@@ -52,16 +50,16 @@ def sniper_movie_mapping(m):
         "title": m.get("title") or m.get("original_title") or "Untitled",
         "slug": str(movie_id),
         "thumbnail_url": f"https://image.tmdb.org/t/p/w500{poster}" if poster else "https://images.unsplash.com/photo-1440404653325-ab127d49abc1?q=80&w=500",
-        "trailer_url": f"{STREAM_BASE}/trailer/{movie_id}", # Key 3: Instant TikTok background engine
+        "trailer_url": f"{STREAM_BASE}/trailer/{movie_id}", 
     }
 
 @app.get("/")
 def root():
-    return {"status": "online", "engine": "High-Speed Sniper v3.5"}
+    return {"status": "online", "engine": "High-Speed Sniper v3.6 - IMDb ID Bridge Active"}
 
 @app.get("/feed")
 def feed(page: int = Query(1, ge=1)):
-    """High-velocity discovery array feeding your main application loop"""
+    """Discovery feed array using standard TMDB data"""
     if not TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="TMDB API Key missing from environment configurations.")
         
@@ -82,21 +80,19 @@ def feed(page: int = Query(1, ge=1)):
 def movie(slug: str):
     """
     The Core Sniper Calculation Engine.
-    Simulates your old pre-split bucket architecture by using pure chronology math.
-    Points the stream URLs back to our high-velocity redirect gateway.
+    Keeps everything running on your 5-minute custom episodic split math.
     """
     if not TMDB_API_KEY:
         raise HTTPException(status_code=500, detail="TMDB API Key missing from environment configurations.")
 
     try:
-        # Pull core structural properties directly from worldwide asset registers
         tmdb_url = f"https://api.themoviedb.org/3/movie/{slug}?api_key={TMDB_API_KEY}"
         movie_info = requests.get(tmdb_url, timeout=4).json()
         
         if "status_code" in movie_info and movie_info["status_code"] == 34:
             raise HTTPException(status_code=404, detail="Target asset missing from global registry")
             
-        runtime = movie_info.get("runtime", 120)  # Safe execution fallback
+        runtime = movie_info.get("runtime", 120)  
         
         # HIGH-SPEED CHRONOLOGICAL SLICING MATRIX
         episode_length_mins = 5
@@ -108,7 +104,6 @@ def movie(slug: str):
             episodes_list.append({
                 "id": i,
                 "episode_number": i,
-                # Directs Flutter to query your own server redirector for a raw video track
                 "url": f"/api/stream/{slug}/ep{i}", 
                 "seek_seconds": start_seconds
             })
@@ -124,22 +119,37 @@ def movie(slug: str):
 @app.get("/api/stream/{slug}/ep{ep}")
 def stream_resolver(slug: str, ep: int):
     """
-    High-Speed Video Stream Resolver Gateway.
-    Intercepts the video player's request and performs an instant 302 redirect
-    to a raw, playable asset link, bypassing HTML frame firewalls cleanly.
+    The IMDb ID Bridge Gateway.
+    Takes your TMDB numerical ID, fetches the 'ttXXXXXX' IMDb counterpart,
+    and forwards it directly to VidLink so the video plays instantly.
     """
     try:
-        vidlink_api = f"{STREAM_BASE}/api/movie/{slug}"
+        # 1. Ask TMDB for the external IDs mapping link
+        id_lookup_url = f"https://api.themoviedb.org/3/movie/{slug}?api_key={TMDB_API_KEY}"
+        tmdb_data = requests.get(id_lookup_url, timeout=3).json()
         
-        try:
-            api_response = requests.get(vidlink_api, timeout=3).json()
-            if api_response.get("stream_url"):
-                # If a clean .m3u8/.mp4 is extracted from the provider network, route to it instantly
-                return RedirectResponse(url=api_response["stream_url"], status_code=302)
-        except:
-            pass # Fall through to the unblocked vector if third-party API limits or times out
-            
-        # EMERGENCY UNBLOCKED VECTOR: Guarantees your native components never sit on a blank layout
+        # Pull the standard alphanumeric IMDb tracking identifier
+        imdb_id = tmdb_data.get("imdb_id")
+        
+        # If the lookup fails, try fallback string method
+        if not imdb_id or not str(imdb_id).startswith("tt"):
+            # Fall back to checking embedded sub-dictionary configurations
+            external_url = f"https://api.themoviedb.org/3/movie/{slug}/external_ids?api_key={TMDB_API_KEY}"
+            ext_data = requests.get(external_url, timeout=3).json()
+            imdb_id = ext_data.get("imdb_id")
+
+        # 2. Forward the valid IMDb ID directly to VidLink's parser engine
+        if imdb_id:
+            vidlink_api = f"{STREAM_BASE}/api/movie/{imdb_id}"
+            try:
+                api_response = requests.get(vidlink_api, timeout=3).json()
+                if api_response.get("stream_url"):
+                    return RedirectResponse(url=api_response["stream_url"], status_code=302)
+            except:
+                pass
+
+        # EMERGENCY FALLBACK: If video doesn't exist on provider servers, play test loop 
+        # so your components never hang on a dead black layout frame.
         fallback_video = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
         return RedirectResponse(url=fallback_video, status_code=302)
 
