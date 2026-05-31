@@ -1,5 +1,4 @@
 fastapi
-uvicorn
+uvicorn[standard]
 requests
 python-dotenv
-yt-dlp
