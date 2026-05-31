@@ -2,4 +2,4 @@ fastapi
 uvicorn
 requests
 python-dotenv
-h11
+yt-dlp
