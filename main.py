@@ -29,13 +29,13 @@ app.add_middleware(
 
 # Configs
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
-PRODUCTION_DOMAIN = os.getenv("PRODUCTION_DOMAIN", "https://onrender.com")
-FALLBACK_URL = "https://googleapis.com"
+PRODUCTION_DOMAIN = os.getenv("PRODUCTION_DOMAIN", "https://tt-b577.onrender.com")
+FALLBACK_URL = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
 
 def get_tmdb(endpoint: str, params: dict = None):
     params = params or {}
     params["api_key"] = TMDB_API_KEY
-    url = f"https://themoviedb.org{endpoint}"
+    url = f"https://api.themoviedb.org/3/{endpoint}"
     response = requests.get(url, params=params, timeout=5)
     response.raise_for_status()
     return response.json()
@@ -45,7 +45,7 @@ def map_movie(m: dict) -> dict:
     return {
         "id": m.get("id"),
         "title": m.get("title") or m.get("original_title") or "Untitled",
-        "thumbnail_url": f"https://tmdb.org{poster}" if poster else "https://unsplash.com",
+        "thumbnail_url": f"https://image.tmdb.org/t/p/w500{poster}" if poster else "https://images.unsplash.com/photo-1440404653325-ab127d49abc1?q=80&w=500",
     }
 
 @app.get("/")
@@ -82,39 +82,20 @@ def movie(slug: str):
 @app.get("/api/stream/{slug}/ep{ep}")
 def stream_resolver(slug: str, ep: int):
     try:
-        # 1. Get IMDb ID
+        # Get IMDb ID
         tmdb_data = get_tmdb(f"movie/{slug}")
         imdb_id = tmdb_data.get("imdb_id")
         if not imdb_id:
             ext = get_tmdb(f"movie/{slug}/external_ids")
             imdb_id = ext.get("imdb_id") or f"tt{slug}"
 
-        # 2. Query VidLink
-        vidlink_url = f"https://vidlink.pro{imdb_id}"
-        
-        # FIX: Stopped requests from chasing the stream asset internally 
-        res = requests.get(vidlink_url, timeout=5, allow_redirects=False)
-        
-        # 3. Handle VidLink's structural response layouts
-        # Match case A: API replies with direct redirect status code
-        if res.status_code in [301, 302, 307, 308]:
-            redirect_target = res.headers.get("Location")
-            if redirect_target:
-                return RedirectResponse(url=redirect_target, status_code=302)
-
-        # Match case B: API replies with standard status code and text/json payload
+        # Fetch from VidLink
+        res = requests.get(f"https://vidlink.pro/api/movie/{imdb_id}", timeout=5)
         if res.status_code == 200:
-            try:
-                json_data = res.json()
-                stream_url = json_data.get("stream_url")
-                if stream_url: 
-                    return RedirectResponse(url=stream_url, status_code=302)
-            except Exception:
-                # Fallback if 200 payload happens to be an unparsed text block of the stream URL
-                if res.text and res.text.startswith("http"):
-                    return RedirectResponse(url=res.text.strip(), status_code=302)
+            url = res.json().get("stream_url")
+            if url: return RedirectResponse(url=url)
             
-        return RedirectResponse(url=FALLBACK_URL, status_code=302)
+        return RedirectResponse(url=FALLBACK_URL)
     except Exception as e:
         logger.error(f"Stream resolve error: {e}")
-        return RedirectResponse(url=FALLBACK_URL, status_code=302)
+        return RedirectResponse(url=FALLBACK_URL)
