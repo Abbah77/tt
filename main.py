@@ -106,90 +106,146 @@ def map_movie(m: dict) -> dict:
     }
 
 
-# ── Trailer Proxy (the key route) ─────────────────────────────────────────────
+# ── Trailer Proxy ─────────────────────────────────────────────────────────────
 
-# Cache resolved direct stream URLs too (they expire after ~6 hours on YouTube)
-_stream_cache: dict[str, str] = {}
+# Stream URLs from Invidious/Piped expire after ~6h — cache with timestamp
+import time
+_stream_cache: dict[str, tuple[str, float]] = {}  # key → (url, timestamp)
+CACHE_TTL = 4 * 3600  # 4 hours
 
-PIPED_INSTANCES = [
-    "https://piped.video",
-    "https://piped.adminforge.de",
-    "https://piped.privacydev.net",
+# Invidious instances — open-source YouTube frontend with a proper JSON API
+# These are specifically designed for programmatic server-to-server access
+# unlike Piped which blocks non-browser requests
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.privacydev.net",
+    "https://iv.datura.network",
+    "https://invidious.perennialte.ch",
+    "https://invidious.fdn.fr",
 ]
+
+
+def _pick_best_stream(formats: list[dict]) -> str | None:
+    """
+    Pick the best single-file mp4 video stream from Invidious adaptiveFormats.
+    Prefers: mp4 container, video+audio combined, max 720p.
+    """
+    if not formats:
+        return None
+
+    # Invidious returns adaptiveFormats like:
+    # { "url": "...", "type": "video/mp4; codecs=...", "quality": "720p",
+    #   "container": "mp4", "encoding": "h264" }
+
+    def score(f):
+        container = f.get("container", "")
+        type_     = f.get("type", "")
+        quality   = f.get("quality", "")
+        q_num = 0
+        try:
+            q_num = int(quality.replace("p", "").split(".")[0])
+        except Exception:
+            pass
+
+        is_mp4     = "mp4" in container.lower() or "mp4" in type_.lower()
+        is_h264    = "h264" in type_.lower() or "avc" in type_.lower()
+        has_audio  = "audio" not in type_.lower() or f.get("audioSampleRate")
+        under_720  = q_num <= 720 and q_num > 0
+
+        if not is_mp4:
+            return -1
+        return (int(is_h264) * 1000) + (int(under_720) * 500) + q_num
+
+    ranked = sorted(formats, key=score, reverse=True)
+    for f in ranked:
+        url = f.get("url")
+        if url and score(f) > 0:
+            return url
+
+    return None
+
 
 @app.get("/proxy/trailer/{key}")
 def trailer_proxy(key: str):
     """
-    Resolves a YouTube key → direct streamable video URL via Piped API.
+    Resolves YouTube key → direct MP4 stream via Invidious API.
 
-    Piped is open-source YouTube frontend. Its /api/streams/{key} endpoint
-    returns direct video stream URLs that media_kit can play — no yt-dlp,
-    no subprocess, response in ~200ms. Completely free and legal.
+    Invidious /api/v1/videos/{key} returns adaptiveFormats with direct
+    video URLs. These are the actual YouTube CDN URLs — media_kit plays
+    them natively with no extra setup.
 
-    Falls back through multiple Piped instances if one is down.
+    Tries multiple public Invidious instances as fallback.
+    Caches results for 4 hours to avoid hammering instances.
     """
-    # Return cached stream URL if we have a fresh one
+    # Return cached URL if still fresh
     if key in _stream_cache:
-        return RedirectResponse(url=_stream_cache[key], status_code=302)
+        url, ts = _stream_cache[key]
+        if time.time() - ts < CACHE_TTL:
+            logger.info(f"Cache hit for {key}")
+            return RedirectResponse(url=url, status_code=302)
+        else:
+            del _stream_cache[key]
 
-    for instance in PIPED_INSTANCES:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+
+    for instance in INVIDIOUS_INSTANCES:
         try:
+            logger.info(f"Trying Invidious instance: {instance}")
             r = requests.get(
-                f"{instance}/api/streams/{key}",
-                timeout=6,
-                headers={"User-Agent": "Mozilla/5.0"},
+                f"{instance}/api/v1/videos/{key}",
+                params={"fields": "adaptiveFormats,formatStreams"},
+                headers=headers,
+                timeout=7,
             )
+
             if r.status_code != 200:
+                logger.warning(f"{instance} returned {r.status_code}")
+                continue
+
+            # Make sure we got JSON not HTML
+            content_type = r.headers.get("content-type", "")
+            if "html" in content_type.lower():
+                logger.warning(f"{instance} returned HTML — instance down")
                 continue
 
             data = r.json()
 
-            # videoStreams is a list of {url, quality, mimeType, ...}
-            streams = data.get("videoStreams", [])
+            # Try adaptiveFormats first (separate video+audio streams)
+            adaptive = data.get("adaptiveFormats", [])
+            url = _pick_best_stream(adaptive)
 
-            # Pick best mp4 stream at or under 720p
-            mp4_streams = [
-                s for s in streams
-                if "mp4" in s.get("mimeType", "").lower()
-                or s.get("format", "").upper() == "MPEG_4"
-            ]
+            # Fall back to formatStreams (combined video+audio, usually lower quality)
+            if not url:
+                combined = data.get("formatStreams", [])
+                # formatStreams are already combined, just pick best mp4
+                for f in reversed(combined):  # last = highest quality
+                    if "mp4" in f.get("container", "").lower():
+                        url = f.get("url")
+                        break
 
-            # Sort by quality — pick highest under 720p
-            def quality_num(s):
-                q = s.get("quality", "0p").replace("p", "")
-                try:
-                    return int(q)
-                except ValueError:
-                    return 0
+            if url:
+                _stream_cache[key] = (url, time.time())
+                logger.info(f"✓ Resolved {key} via {instance}")
+                return RedirectResponse(url=url, status_code=302)
+            else:
+                logger.warning(f"{instance}: no playable stream found in response")
 
-            mp4_streams.sort(key=quality_num, reverse=True)
-            best = next((s for s in mp4_streams if quality_num(s) <= 720), None)
-            if not best and mp4_streams:
-                best = mp4_streams[-1]  # lowest quality as last resort
-
-            if best and best.get("url"):
-                stream_url = best["url"]
-                _stream_cache[key] = stream_url
-                logger.info(f"Piped resolved {key} @ {best.get('quality')} via {instance}")
-                return RedirectResponse(url=stream_url, status_code=302)
-
-            # Also try audioVideoStreams (combined) if videoStreams empty
-            av_streams = data.get("audioVideoStreams", [])
-            if av_streams:
-                url = av_streams[0].get("url")
-                if url:
-                    _stream_cache[key] = url
-                    return RedirectResponse(url=url, status_code=302)
-
+        except requests.exceptions.Timeout:
+            logger.warning(f"{instance} timed out")
         except Exception as e:
-            logger.warning(f"Piped instance {instance} failed for {key}: {e}")
-            continue
+            logger.warning(f"{instance} error: {e}")
+        continue
 
-    # All Piped instances failed — return YouTube embed URL
-    # Flutter can open this in a WebView as last resort
-    logger.error(f"All Piped instances failed for {key}")
+    # ── All instances failed ──────────────────────────────────────────────────
+    # Last resort: return the YouTube nocookie embed URL.
+    # This won't play in media_kit but WILL play in a WebView widget.
+    # Better than a broken video.
+    logger.error(f"All Invidious instances failed for {key} — returning YouTube fallback")
     return RedirectResponse(
-        url=f"https://www.youtube.com/watch?v={key}",
+        url=f"https://www.youtube-nocookie.com/embed/{key}?autoplay=1",
         status_code=302,
     )
 
