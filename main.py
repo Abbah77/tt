@@ -1,19 +1,25 @@
 import os
 import logging
+import time
 import requests
-import json
-import re
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
-from typing import List, Dict, Optional
-import uvicorn
+from dotenv import load_dotenv
+
+# ── Optional Supabase ─────────────────────────────────────────────────────────
+try:
+    from supabase import create_client, Client as SupabaseClient
+    _supabase_available = True
+except ImportError:
+    _supabase_available = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+load_dotenv()
 
-app = FastAPI(title="Reelz Gateway - Working Edition", version="13.0.0")
+app = FastAPI(title="Reelz Gateway", version="11.0.0")
 app.add_middleware(GZipMiddleware, minimum_size=256)
 app.add_middleware(
     CORSMiddleware,
@@ -22,370 +28,326 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Config ────────────────────────────────────────────────────────────────────
+TMDB_API_KEY   = os.getenv("TMDB_API_KEY")
+DOMAIN         = os.getenv("PRODUCTION_DOMAIN", "https://tt-b577.onrender.com")
+SUPABASE_URL   = os.getenv("SUPABASE_URL")
+SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY")   # service role key
+TMDB_IMG       = "https://image.tmdb.org/t/p/w500"
 FALLBACK_THUMB = "https://images.unsplash.com/photo-1440404653325-ab127d49abc1?q=80&w=500"
 
-# ============================================================
-# WORKING SOURCE 1: Consumet API (Movies/TV Shows with m3u8)
-# ============================================================
+# ── Supabase client ───────────────────────────────────────────────────────────
+_sb: "SupabaseClient | None" = None
 
-CONSUMET_API = "https://api.consumet.org"
-
-def fetch_from_consumet(category: str = "trending", page: int = 1) -> List[Dict]:
-    """Fetch movies/TV shows with streaming links from Consumet"""
-    try:
-        # Get popular movies/shows
-        if category == "trending":
-            url = f"{CONSUMET_API}/movies/trending"
-        elif category == "top_rated":
-            url = f"{CONSUMET_API}/movies/top-rated"
-        else:
-            url = f"{CONSUMET_API}/movies/popular"
-        
-        response = requests.get(url, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get("results", [])[:20]
-            
-            dramas = []
-            for item in results:
-                # Get streaming links for each movie
-                movie_id = item.get("id")
-                drama = {
-                    "id": movie_id,
-                    "slug": movie_id,
-                    "title": item.get("title", "Untitled"),
-                    "thumbnail_url": item.get("image", FALLBACK_THUMB),
-                    "description": item.get("description", ""),
-                    "rating": item.get("rating", {}).get("average", 0) if item.get("rating") else 0,
-                    "year": item.get("releaseDate", ""),
-                    "m3u8_url": None,  # Will fetch when playing
-                    "is_movie": True,
-                    "source": "consumet"
-                }
-                dramas.append(drama)
-            
-            logger.info(f"Consumet returned {len(dramas)} items")
-            return dramas
-        
-        return []
-    except Exception as e:
-        logger.error(f"Consumet error: {e}")
-        return []
-
-
-def get_consumet_stream(movie_id: str) -> Optional[str]:
-    """Get streaming URL from Consumet"""
-    try:
-        url = f"{CONSUMET_API}/movies/watch/{movie_id}"
-        response = requests.get(url, timeout=15)
-        
-        if response.status_code == 200:
-            data = response.json()
-            # Try to get m3u8 from sources
-            sources = data.get("sources", [])
-            for source in sources:
-                if source.get("url") and ".m3u8" in source.get("url", ""):
-                    return source.get("url")
-            # Try qualities
-            for source in sources:
-                url = source.get("url")
-                if url and (".m3u8" in url or ".mp4" in url):
-                    return url
+def get_supabase() -> "SupabaseClient | None":
+    global _sb
+    if _sb is not None:
+        return _sb
+    if not _supabase_available:
+        logger.warning("supabase-py not installed; DB features disabled")
         return None
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.warning("SUPABASE_URL / SUPABASE_SERVICE_KEY not set; DB disabled")
+        return None
+    try:
+        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("Supabase connected")
+        return _sb
     except Exception as e:
-        logger.error(f"Consumet stream error: {e}")
+        logger.error(f"Supabase init failed: {e}")
         return None
 
 
-# ============================================================
-# WORKING SOURCE 2: VidSrc API (Direct m3u8 links)
-# ============================================================
+# ── In-memory caches ──────────────────────────────────────────────────────────
+_trailer_cache: dict[int, str | None] = {}
+_stream_cache: dict[str, tuple[str, float]] = {}
+CACHE_TTL = 4 * 3600  # 4 hours
 
-VIDSRC_API = "https://vidsrc.xyz"
+# ── TMDB ──────────────────────────────────────────────────────────────────────
 
-def fetch_from_vidsrc() -> List[Dict]:
-    """Fetch movies with m3u8 links from VidSrc"""
+def tmdb(endpoint: str, params: dict = None) -> dict:
+    p = {"api_key": TMDB_API_KEY, **(params or {})}
+    r = requests.get(
+        f"https://api.themoviedb.org/3/{endpoint}",
+        params=p, timeout=8,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_yt_key(movie_id: int) -> str | None:
+    if movie_id in _trailer_cache:
+        return _trailer_cache[movie_id]
     try:
-        # VidSrc provides direct embed links
-        # Popular movie IDs
-        popular_ids = ["tt0111161", "tt0068646", "tt0071562", "tt0468569", "tt0137523"]
-        
-        dramas = []
-        for idx, movie_id in enumerate(popular_ids):
-            drama = {
-                "id": movie_id,
-                "slug": movie_id,
-                "title": get_movie_title_from_imdb(movie_id),
-                "thumbnail_url": f"https://img.omdbapi.com/?apikey=YOUR_KEY&i={movie_id}" if False else FALLBACK_THUMB,
-                "description": "Popular movie with streaming available",
-                "m3u8_url": f"https://vidsrc.xyz/embed/movie/{movie_id}",
-                "episodes": [{"id": 1, "episode_number": 1, "url": f"https://vidsrc.xyz/embed/movie/{movie_id}"}],
-                "source": "vidsrc"
-            }
-            dramas.append(drama)
-        
-        return dramas
+        videos = tmdb(f"movie/{movie_id}/videos").get("results", [])
+        for kind in ("Trailer", "Teaser", "Clip", "Featurette"):
+            for v in videos:
+                if v.get("site") == "YouTube" and v.get("type") == kind:
+                    _trailer_cache[movie_id] = v["key"]
+                    return v["key"]
     except Exception as e:
-        logger.error(f"VidSrc error: {e}")
-        return []
+        logger.warning(f"TMDB videos failed for {movie_id}: {e}")
+    _trailer_cache[movie_id] = None
+    return None
 
 
-def get_movie_title_from_imdb(imdb_id: str) -> str:
-    """Get movie title from IMDb ID"""
-    titles = {
-        "tt0111161": "The Shawshank Redemption",
-        "tt0068646": "The Godfather",
-        "tt0071562": "The Godfather Part II",
-        "tt0468569": "The Dark Knight",
-        "tt0137523": "Fight Club"
-    }
-    return titles.get(imdb_id, "Popular Movie")
+def build_trailer_url(movie_id: int) -> str | None:
+    key = get_yt_key(movie_id)
+    if not key:
+        return None
+    return f"{DOMAIN}/proxy/trailer/{key}"
 
 
-# ============================================================
-# WORKING SOURCE 3: TMDB + FMovies Scraper (Most Reliable)
-# ============================================================
-
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "1eef1496d59aa06f62e201ddce2741b4")  # Get free key from themoviedb.org
-TMDB_IMG = "https://image.tmdb.org/t/p/w500"
-
-def fetch_tmdb_movies(page: int = 1) -> List[Dict]:
-    """Fetch movies from TMDB (metadata only)"""
-    if not TMDB_API_KEY or TMDB_API_KEY == "YOUR_TMDB_KEY":
-        return []
-    
-    try:
-        url = f"https://api.themoviedb.org/3/movie/popular"
-        params = {
-            "api_key": TMDB_API_KEY,
-            "page": page,
-            "language": "en-US"
-        }
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get("results", [])
-            
-            movies = []
-            for item in results:
-                movies.append({
-                    "id": str(item.get("id")),
-                    "slug": str(item.get("id")),
-                    "title": item.get("title", "Untitled"),
-                    "thumbnail_url": f"{TMDB_IMG}{item.get('poster_path')}" if item.get("poster_path") else FALLBACK_THUMB,
-                    "description": item.get("overview", ""),
-                    "rating": item.get("vote_average", 0),
-                    "year": item.get("release_date", "")[:4],
-                    "m3u8_url": None,  # Will get from scraper
-                    "is_movie": True,
-                    "source": "tmdb"
-                })
-            
-            return movies
-        return []
-    except Exception as e:
-        logger.error(f"TMDB error: {e}")
-        return []
-
-
-# ============================================================
-# MAIN API ENDPOINTS
-# ============================================================
-
-@app.get("/api/dramas")
-def get_dramas(
-    limit: int = Query(20, le=50),
-    source: str = Query("tmdb", enum=["tmdb", "consumet", "vidsrc"])
-):
-    """Get drama/movie catalog with title and thumbnail"""
-    try:
-        dramas = []
-        
-        if source == "tmdb":
-            dramas = fetch_tmdb_movies(page=1)
-        elif source == "consumet":
-            dramas = fetch_from_consumet(category="trending")
-        elif source == "vidsrc":
-            dramas = fetch_from_vidsrc()
-        
-        if not dramas or len(dramas) == 0:
-            # Return guaranteed working test data
-            dramas = get_guaranteed_working_data()
-        
-        return {
-            "data": dramas[:limit],
-            "total": len(dramas[:limit]),
-            "source": source,
-            "status": "success"
-        }
-        
-    except Exception as e:
-        logger.error(f"Dramas error: {e}")
-        return {
-            "data": get_guaranteed_working_data(),
-            "source": "fallback",
-            "status": "fallback_used",
-            "error": str(e)
-        }
-
-
-@app.get("/api/drama/{drama_id}")
-def get_drama_detail(drama_id: str, source: str = Query("tmdb")):
-    """Get drama details including streaming URL"""
-    try:
-        # Try to get streaming URL for this drama
-        stream_url = None
-        
-        # For TMDB IDs, try to get stream
-        if source == "tmdb" and drama_id.isdigit():
-            stream_url = get_stream_for_movie(int(drama_id))
-        
-        # Get metadata
-        detail = {
-            "id": drama_id,
-            "title": f"Drama {drama_id}",
-            "thumbnail_url": FALLBACK_THUMB,
-            "description": "Streaming available. Use the stream URL to play.",
-            "year": "2024",
-            "rating": 7.5,
-            "stream_url": stream_url,
-            "episodes": [
-                {
-                    "id": 1,
-                    "episode_number": 1,
-                    "title": "Full Movie",
-                    "url": stream_url or get_fallback_stream()
-                }
-            ],
-            "total_episodes": 1
-        }
-        
-        # If we have TMDB API, get real metadata
-        if TMDB_API_KEY and TMDB_API_KEY != "YOUR_TMDB_KEY" and drama_id.isdigit():
-            try:
-                url = f"https://api.themoviedb.org/3/movie/{drama_id}"
-                params = {"api_key": TMDB_API_KEY, "language": "en-US"}
-                response = requests.get(url, params=params, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    detail["title"] = data.get("title", detail["title"])
-                    detail["description"] = data.get("overview", detail["description"])
-                    detail["year"] = data.get("release_date", "")[:4]
-                    detail["rating"] = data.get("vote_average", detail["rating"])
-                    if data.get("poster_path"):
-                        detail["thumbnail_url"] = f"{TMDB_IMG}{data.get('poster_path')}"
-            except:
-                pass
-        
-        return detail
-        
-    except Exception as e:
-        logger.error(f"Detail error: {e}")
-        return {
-            "id": drama_id,
-            "title": "Test Drama (Stream Available)",
-            "thumbnail_url": FALLBACK_THUMB,
-            "description": "This is a test stream that definitely works.",
-            "stream_url": get_fallback_stream(),
-            "episodes": [{"id": 1, "episode_number": 1, "title": "Play", "url": get_fallback_stream()}]
-        }
-
-
-@app.get("/api/stream/{drama_id}/{episode_id}")
-def get_stream_url(drama_id: str, episode_id: int):
-    """Get working m3u8 URL for playback"""
-    stream_url = get_fallback_stream()
-    
+def map_movie(m: dict) -> dict:
+    movie_id = m.get("id")
+    poster   = m.get("poster_path")
     return {
-        "url": stream_url,
-        "expires_in": 3600,
-        "quality": "720p",
-        "status": "success"
+        "id":            movie_id,
+        "slug":          str(movie_id),
+        "title":         m.get("title") or m.get("original_title") or "Untitled",
+        "thumbnail_url": f"{TMDB_IMG}{poster}" if poster else FALLBACK_THUMB,
+        "trailer_url":   build_trailer_url(movie_id),
     }
 
 
-def get_stream_for_movie(movie_id: int) -> Optional[str]:
-    """Try to get a working stream URL for a movie"""
-    # Use 2embed.to (works reliably)
-    return f"https://www.2embed.to/embed/tmdb/movie?id={movie_id}"
+# ── Invidious trailer proxy ───────────────────────────────────────────────────
+
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.privacydev.net",
+    "https://iv.datura.network",
+    "https://invidious.perennialte.ch",
+    "https://invidious.fdn.fr",
+]
 
 
-def get_fallback_stream() -> str:
-    """Return a guaranteed working m3u8 test stream"""
-    # This is a known working test stream from Mux
-    return "https://stream.mux.com/VZtzUzGRv02OhRnZCxcNg49OilvolTqjFzq39ivSNyRM/high.mp4"
+def _pick_best_stream(formats: list[dict]) -> str | None:
+    if not formats:
+        return None
+
+    def score(f):
+        container = f.get("container", "")
+        type_     = f.get("type", "")
+        quality   = f.get("quality", "")
+        q_num = 0
+        try:
+            q_num = int(quality.replace("p", "").split(".")[0])
+        except Exception:
+            pass
+        is_mp4    = "mp4" in container.lower() or "mp4" in type_.lower()
+        is_h264   = "h264" in type_.lower() or "avc" in type_.lower()
+        under_720 = q_num <= 720 and q_num > 0
+        if not is_mp4:
+            return -1
+        return (int(is_h264) * 1000) + (int(under_720) * 500) + q_num
+
+    ranked = sorted(formats, key=score, reverse=True)
+    for f in ranked:
+        url = f.get("url")
+        if url and score(f) > 0:
+            return url
+    return None
 
 
-def get_guaranteed_working_data() -> List[Dict]:
-    """Return content that definitely works"""
-    return [
-        {
-            "id": "tt0111161",
-            "slug": "shawshank",
-            "title": "The Shawshank Redemption",
-            "thumbnail_url": "https://image.tmdb.org/t/p/w500/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg",
-            "description": "Two imprisoned men bond over a number of years, finding solace and eventual redemption through acts of common decency.",
-            "rating": 9.3,
-            "year": "1994",
-            "m3u8_url": get_fallback_stream(),
-            "source": "guaranteed"
-        },
-        {
-            "id": "tt0468569",
-            "slug": "dark-knight",
-            "title": "The Dark Knight",
-            "thumbnail_url": "https://image.tmdb.org/t/p/w500/qJ2tW6WMUDux911r6m7haRef0WH.jpg",
-            "description": "When the menace known as the Joker wreaks havoc and chaos on the people of Gotham, Batman must accept one of the greatest psychological and physical tests of his ability to fight injustice.",
-            "rating": 9.0,
-            "year": "2008",
-            "m3u8_url": get_fallback_stream(),
-            "source": "guaranteed"
-        },
-        {
-            "id": "tt0137523",
-            "slug": "fight-club",
-            "title": "Fight Club",
-            "thumbnail_url": "https://image.tmdb.org/t/p/w500/pB8BM7pdSp6B6Ih7QZ4DrQ3PmJK.jpg",
-            "description": "An insomniac office worker and a devil-may-care soap maker form an underground fight club that evolves into much more.",
-            "rating": 8.8,
-            "year": "1999",
-            "m3u8_url": get_fallback_stream(),
-            "source": "guaranteed"
-        },
-        {
-            "id": "tt1375666",
-            "slug": "inception",
-            "title": "Inception",
-            "thumbnail_url": "https://image.tmdb.org/t/p/w500/9gk7adHYeDvHkCSEqAvQNLV5Uge.jpg",
-            "description": "A thief who steals corporate secrets through the use of dream-sharing technology is given the inverse task of planting an idea into the mind of a C.E.O.",
-            "rating": 8.8,
-            "year": "2010",
-            "m3u8_url": get_fallback_stream(),
-            "source": "guaranteed"
+@app.get("/proxy/trailer/{key}")
+def trailer_proxy(key: str):
+    if key in _stream_cache:
+        url, ts = _stream_cache[key]
+        if time.time() - ts < CACHE_TTL:
+            return RedirectResponse(url=url, status_code=302)
+        del _stream_cache[key]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            r = requests.get(
+                f"{instance}/api/v1/videos/{key}",
+                params={"fields": "adaptiveFormats,formatStreams"},
+                headers=headers,
+                timeout=7,
+            )
+            if r.status_code != 200:
+                continue
+            if "html" in r.headers.get("content-type", "").lower():
+                continue
+
+            data = r.json()
+            url = _pick_best_stream(data.get("adaptiveFormats", []))
+            if not url:
+                for f in reversed(data.get("formatStreams", [])):
+                    if "mp4" in f.get("container", "").lower():
+                        url = f.get("url")
+                        break
+
+            if url:
+                _stream_cache[key] = (url, time.time())
+                return RedirectResponse(url=url, status_code=302)
+
+        except requests.exceptions.Timeout:
+            continue
+        except Exception as e:
+            logger.warning(f"{instance} error: {e}")
+            continue
+
+    return RedirectResponse(
+        url=f"https://www.youtube-nocookie.com/embed/{key}?autoplay=1",
+        status_code=302,
+    )
+
+
+# ── Feed ──────────────────────────────────────────────────────────────────────
+
+@app.get("/feed")
+def feed(cursor: int = Query(None), limit: int = Query(10, le=20)):
+    try:
+        page   = ((cursor or 0) // 20) + 1
+        offset = (cursor or 0) % 20
+        data        = tmdb("discover/movie", {"sort_by": "popularity.desc", "page": page})
+        results     = data.get("results", [])
+        total_pages = data.get("total_pages", 1)
+        slice_      = results[offset: offset + limit]
+        next_cursor = (cursor or 0) + len(slice_) if slice_ else None
+        has_more    = page < total_pages
+        return {
+            "data":        [map_movie(r) for r in slice_],
+            "next_cursor": next_cursor if has_more else None,
+            "has_more":    has_more,
         }
-    ]
+    except Exception as e:
+        logger.error(f"Feed error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch feed")
 
+
+# ── Search ────────────────────────────────────────────────────────────────────
+
+@app.get("/search")
+def search(q: str = Query(..., min_length=1), limit: int = Query(20, le=40)):
+    try:
+        results = tmdb("search/movie", {"query": q, "include_adult": False}
+                       ).get("results", [])[:limit]
+        return {"data": [map_movie(r) for r in results]}
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
+
+
+# ── Movie detail ──────────────────────────────────────────────────────────────
+
+@app.get("/movie/{slug}")
+def movie_detail(slug: str):
+    try:
+        info   = tmdb(f"movie/{slug}")
+        yt_key = get_yt_key(int(slug))
+        ep_url = f"{DOMAIN}/proxy/trailer/{yt_key}" if yt_key else None
+        return {
+            "movie":          map_movie(info),
+            "episodes": [{"id": 1, "episode_number": 1, "url": ep_url or ""}],
+            "total_episodes": 1,
+        }
+    except Exception as e:
+        logger.error(f"Movie detail error {slug}: {e}")
+        raise HTTPException(status_code=404, detail="Movie not found")
+
+
+# ── User likes / saves (Supabase) ─────────────────────────────────────────────
+# All endpoints are protected by google_user_id (verified by client).
+# We store only TMDB IDs — no media, no file blobs, just integers.
+#
+# Supabase schema (run once in SQL editor):
+#
+# create table if not exists user_interactions (
+#   id            bigserial primary key,
+#   google_user_id text not null,
+#   tmdb_id        integer not null,
+#   kind           text not null check (kind in ('like', 'save')),
+#   created_at     timestamptz default now(),
+#   unique (google_user_id, tmdb_id, kind)
+# );
+# create index on user_interactions (google_user_id, kind);
+
+
+@app.get("/user/{uid}/interactions")
+def get_interactions(uid: str):
+    """Return all liked + saved TMDB IDs for a user."""
+    sb = get_supabase()
+    if not sb:
+        return {"liked": [], "saved": []}
+    try:
+        rows = (
+            sb.table("user_interactions")
+            .select("tmdb_id, kind")
+            .eq("google_user_id", uid)
+            .execute()
+        ).data
+        liked = [r["tmdb_id"] for r in rows if r["kind"] == "like"]
+        saved = [r["tmdb_id"] for r in rows if r["kind"] == "save"]
+        return {"liked": liked, "saved": saved}
+    except Exception as e:
+        logger.error(f"get_interactions error: {e}")
+        return {"liked": [], "saved": []}
+
+
+@app.post("/user/{uid}/like/{tmdb_id}")
+def toggle_like(uid: str, tmdb_id: int):
+    return _toggle(uid, tmdb_id, "like")
+
+
+@app.post("/user/{uid}/save/{tmdb_id}")
+def toggle_save(uid: str, tmdb_id: int):
+    return _toggle(uid, tmdb_id, "save")
+
+
+def _toggle(uid: str, tmdb_id: int, kind: str) -> dict:
+    sb = get_supabase()
+    if not sb:
+        return {"status": "no_db"}
+    try:
+        existing = (
+            sb.table("user_interactions")
+            .select("id")
+            .eq("google_user_id", uid)
+            .eq("tmdb_id", tmdb_id)
+            .eq("kind", kind)
+            .execute()
+        ).data
+        if existing:
+            sb.table("user_interactions").delete().eq(
+                "id", existing[0]["id"]
+            ).execute()
+            return {"status": "removed"}
+        else:
+            sb.table("user_interactions").insert(
+                {"google_user_id": uid, "tmdb_id": tmdb_id, "kind": kind}
+            ).execute()
+            return {"status": "added"}
+    except Exception as e:
+        logger.error(f"toggle {kind} error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
+    test_id = 550  # Fight Club
+    key = get_yt_key(test_id)
+    sb_ok = get_supabase() is not None
     return {
-        "status": "online",
-        "version": "13.0.0",
-        "message": "Backend is working with guaranteed content",
-        "endpoints": {
-            "/api/dramas": "Get catalog",
-            "/api/drama/{id}": "Get details",
-            "/api/stream/{id}/{ep}": "Get stream URL"
-        }
+        "status":          "online",
+        "version":         "11.0.0",
+        "tmdb_key_set":    bool(TMDB_API_KEY),
+        "supabase_ready":  sb_ok,
+        "test_movie":      "Fight Club (id=550)",
+        "yt_key":          key,
+        "trailer_url":     f"{DOMAIN}/proxy/trailer/{key}" if key else None,
+        "invidious_instances": INVIDIOUS_INSTANCES,
     }
 
 
 @app.get("/")
 def root():
-    return {"status": "online", "message": "Use /api/dramas to get content"}
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"status": "online", "version": "11.0.0"}
