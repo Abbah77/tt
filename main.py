@@ -147,7 +147,7 @@ def get_movie_title_from_imdb(imdb_id: str) -> str:
 # WORKING SOURCE 3: TMDB + FMovies Scraper (Most Reliable)
 # ============================================================
 
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "YOUR_TMDB_KEY")  # Get free key from themoviedb.org
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "1eef1496d59aa06f62e201ddce2741b4")  # Get free key from themoviedb.org
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
 def fetch_tmdb_movies(page: int = 1) -> List[Dict]:
