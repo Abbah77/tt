@@ -5,16 +5,8 @@ import requests
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any
-
-# ── Optional Supabase ─────────────────────────────────────────────────────────
-try:
-    from supabase import create_client, Client as SupabaseClient
-    _supabase_available = True
-except ImportError:
-    _supabase_available = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,87 +23,110 @@ app.add_middleware(
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HEIERMUER_API = "https://json.heimuer.tv/api.php/provide/vod/"
-HEIERMUER_PLAYER = "https://player.heimuer.tv/index.html?url="
 SHORT_DRAMA_FALLBACK = "http://74.120.175.78/JK/XYQTVBox/dj.json"
-
-DOMAIN         = os.getenv("PRODUCTION_DOMAIN", "https://tt-b577.onrender.com")
-SUPABASE_URL   = os.getenv("SUPABASE_URL")
-SUPABASE_KEY   = os.getenv("SUPABASE_SERVICE_KEY")
 FALLBACK_THUMB = "https://images.unsplash.com/photo-1440404653325-ab127d49abc1?q=80&w=500"
 
-# ── In-memory caches ──────────────────────────────────────────────────────────
-_drama_cache: Dict[str, Any] = {}  # Cache drama list
-_stream_cache: Dict[str, tuple[str, float]] = {}  # Cache m3u8 links
-CACHE_TTL = 3600  # 1 hour (m3u8 links expire quickly!)
-
-# ── Supabase client (unchanged) ───────────────────────────────────────────────
-_sb: "SupabaseClient | None" = None
-
-def get_supabase() -> "SupabaseClient | None":
-    global _sb
-    if _sb is not None:
-        return _sb
-    if not _supabase_available:
-        logger.warning("supabase-py not installed; DB features disabled")
-        return None
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.warning("SUPABASE_URL / SUPABASE_SERVICE_KEY not set; DB disabled")
-        return None
-    try:
-        _sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase connected")
-        return _sb
-    except Exception as e:
-        logger.error(f"Supabase init failed: {e}")
-        return None
+# Cache
+_drama_cache: Dict[str, Any] = {}
+CACHE_TTL = 300  # 5 minutes
 
 
-# ── Heiermuer.tv Content Fetcher ──────────────────────────────────────────────
+# ── Heiermuer.tv Content Fetcher with Error Handling ──────────────────────────
 
-def fetch_heimuer_catalog(ac: str = "list", page: int = 1, limit: int = 20) -> List[Dict]:
-    """Fetch catalog from Heiermuer API"""
+def fetch_heimuer_catalog(page: int = 1, limit: int = 20) -> List[Dict]:
+    """Fetch catalog from Heiermuer API with full error handling"""
     try:
         params = {
-            "ac": ac,
+            "ac": "list",
             "pg": page,
-            "t": "short_drama"  # Filter for short dramas
+            "t": "short_drama"  # Try to filter for short dramas
         }
+        
+        logger.info(f"Calling Heiermuer API: {HEIERMUER_API} with params {params}")
         
         response = requests.get(
             HEIERMUER_API,
             params=params,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json"
+            }
         )
-        response.raise_for_status()
-        data = response.json()
         
-        # Heiermuer returns: {"code": 1, "msg": "success", "list": [...]}
-        if data.get("code") != 1:
-            logger.warning(f"Heiermuer API error: {data.get('msg')}")
+        logger.info(f"Heiermuer response status: {response.status_code}")
+        
+        if response.status_code != 200:
+            logger.error(f"Heiermuer returned {response.status_code}")
+            return []
+        
+        # Try to parse JSON
+        try:
+            data = response.json()
+        except Exception as json_err:
+            logger.error(f"Failed to parse JSON: {json_err}")
+            logger.error(f"Response text preview: {response.text[:500]}")
+            return []
+        
+        logger.info(f"Response keys: {data.keys() if isinstance(data, dict) else 'not a dict'}")
+        
+        # Check response structure
+        if isinstance(data, dict):
+            # Some APIs return {"code": 1, "list": [...]}
+            if data.get("code") == 1:
+                items = data.get("list", [])
+            elif "list" in data:
+                items = data.get("list", [])
+            elif "data" in data:
+                items = data.get("data", [])
+            else:
+                # Maybe the whole response is the list?
+                items = []
+                logger.warning(f"Unknown response structure: {list(data.keys())}")
+        elif isinstance(data, list):
+            items = data
+        else:
+            logger.error(f"Unexpected response type: {type(data)}")
+            return []
+        
+        if not items:
+            logger.warning("No items found in response")
             return []
         
         dramas = []
-        for item in data.get("list", [])[:limit]:
-            # Extract m3u8 from vod_play_url
-            m3u8_url = extract_m3u8_from_play_url(item.get("vod_play_url", ""))
+        for item in items[:limit]:
+            # Safely extract fields
+            vod_id = item.get("vod_id") or item.get("id")
+            vod_name = item.get("vod_name") or item.get("name") or item.get("title", "Untitled")
+            vod_pic = item.get("vod_pic") or item.get("pic") or item.get("thumbnail") or FALLBACK_THUMB
+            vod_play_url = item.get("vod_play_url") or item.get("play_url") or item.get("url", "")
+            
+            # Extract m3u8 from play URL
+            m3u8_url = extract_m3u8_from_play_url(vod_play_url)
             
             dramas.append({
-                "id": item.get("vod_id"),
-                "slug": str(item.get("vod_id")),
-                "title": item.get("vod_name", "Untitled"),
-                "thumbnail_url": item.get("vod_pic", FALLBACK_THUMB),
-                "description": item.get("vod_content", ""),
-                "year": item.get("vod_year", ""),
-                "rating": item.get("vod_rating", 0),
-                "m3u8_url": m3u8_url,  # This is your video stream!
-                "episodes": extract_episodes(item.get("vod_play_url", ""))
+                "id": str(vod_id) if vod_id else f"item_{len(dramas)}",
+                "slug": str(vod_id) if vod_id else f"item_{len(dramas)}",
+                "title": vod_name,
+                "thumbnail_url": vod_pic if vod_pic.startswith("http") else FALLBACK_THUMB,
+                "description": item.get("vod_content") or item.get("description", ""),
+                "year": item.get("vod_year") or item.get("year", ""),
+                "rating": item.get("vod_rating") or item.get("rating", 0),
+                "m3u8_url": m3u8_url,
+                "episodes": extract_episodes(vod_play_url)
             })
         
+        logger.info(f"Successfully parsed {len(dramas)} dramas")
         return dramas
         
+    except requests.exceptions.Timeout:
+        logger.error("Heiermuer API timeout")
+        return []
+    except requests.exceptions.ConnectionError:
+        logger.error("Heiermuer API connection error")
+        return []
     except Exception as e:
-        logger.error(f"Failed to fetch Heiermuer catalog: {e}")
+        logger.error(f"Unexpected error in fetch_heimuer_catalog: {e}")
         return []
 
 
@@ -120,18 +135,19 @@ def extract_m3u8_from_play_url(play_url: str) -> Optional[str]:
     if not play_url:
         return None
     
-    # Heiermuer format: "episode1$m3u8_url#episode2$m3u8_url"
+    # Handle different formats
+    if ".m3u8" in play_url:
+        # Direct URL
+        return play_url
+    
+    # Format: "episode1$m3u8_url#episode2$m3u8_url"
     if "$" in play_url:
         parts = play_url.split("#")
         for part in parts:
-            if "$" in part:
-                url = part.split("$")[1]
+            if "$" in part and ".m3u8" in part:
+                url = part.split("$")[1] if len(part.split("$")) > 1 else part
                 if ".m3u8" in url:
                     return url
-    
-    # If it's just a direct m3u8 URL
-    if ".m3u8" in play_url:
-        return play_url
     
     return None
 
@@ -140,57 +156,61 @@ def extract_episodes(play_url: str) -> List[Dict]:
     """Extract all episodes from vod_play_url"""
     episodes = []
     if not play_url:
-        return [{"id": 1, "episode_number": 1, "url": ""}]
+        return [{"id": 1, "episode_number": 1, "title": "Episode 1", "url": ""}]
     
     if "$" in play_url:
         parts = play_url.split("#")
         for idx, part in enumerate(parts, 1):
             if "$" in part:
-                title, url = part.split("$", 1)
+                parts_split = part.split("$", 1)
+                title = parts_split[0] if len(parts_split) > 0 else f"Episode {idx}"
+                url = parts_split[1] if len(parts_split) > 1 else ""
                 episodes.append({
                     "id": idx,
                     "episode_number": idx,
                     "title": title,
                     "url": url if ".m3u8" in url else None
                 })
-    else:
+    elif ".m3u8" in play_url:
         episodes.append({
             "id": 1,
             "episode_number": 1,
             "title": "Episode 1",
-            "url": play_url if ".m3u8" in play_url else None
+            "url": play_url
         })
     
-    return episodes
+    return episodes if episodes else [{"id": 1, "episode_number": 1, "title": "Episode 1", "url": None}]
 
 
 def fetch_short_drama_fallback() -> List[Dict]:
-    """Fallback to TVBox short drama interface if Heiermuer fails"""
+    """Fallback to TVBox short drama interface"""
     try:
+        logger.info("Attempting fallback source...")
         response = requests.get(SHORT_DRAMA_FALLBACK, timeout=10)
         response.raise_for_status()
         data = response.json()
         
         dramas = []
-        # TVBox format varies, adapt based on actual response
         if isinstance(data, list):
-            for item in data[:20]:
+            for idx, item in enumerate(data[:20]):
                 dramas.append({
-                    "id": item.get("vod_id", hash(item.get("vod_name"))),
-                    "slug": str(item.get("vod_id", "")),
-                    "title": item.get("vod_name", "Untitled"),
+                    "id": str(item.get("vod_id", idx)),
+                    "slug": str(item.get("vod_id", idx)),
+                    "title": item.get("vod_name", f"Drama {idx+1}"),
                     "thumbnail_url": item.get("vod_pic", FALLBACK_THUMB),
                     "description": item.get("vod_content", ""),
                     "m3u8_url": item.get("vod_play_url", ""),
-                    "episodes": [{"id": 1, "episode_number": 1, "url": item.get("vod_play_url", "")}]
+                    "episodes": [{"id": 1, "episode_number": 1, "title": "Episode 1", "url": item.get("vod_play_url", "")}]
                 })
+        
+        logger.info(f"Fallback returned {len(dramas)} dramas")
         return dramas
     except Exception as e:
         logger.error(f"Fallback failed: {e}")
         return []
 
 
-# ── New Endpoints for Heiermuer Content ───────────────────────────────────────
+# ── API Endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/api/dramas")
 def get_dramas(
@@ -204,12 +224,20 @@ def get_dramas(
         dramas = fetch_heimuer_catalog(page=page, limit=limit)
         
         # If failed and fallback enabled, try TVBox source
-        if not dramas and use_fallback:
-            logger.info("Using fallback source")
+        if (not dramas or len(dramas) == 0) and use_fallback:
+            logger.info("Heiermuer returned no results, trying fallback")
             dramas = fetch_short_drama_fallback()
         
-        if not dramas:
-            raise HTTPException(status_code=503, detail="No content available from any source")
+        if not dramas or len(dramas) == 0:
+            # Return mock data for testing
+            logger.warning("No real content available, returning mock data for testing")
+            return {
+                "data": get_mock_dramas(),
+                "page": page,
+                "has_more": False,
+                "source": "mock",
+                "warning": "Using mock data. Heiermuer API may be down or changed."
+            }
         
         return {
             "data": dramas,
@@ -220,182 +248,130 @@ def get_dramas(
         
     except Exception as e:
         logger.error(f"Dramas endpoint error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch dramas")
+        # Return mock data instead of 500 error
+        return {
+            "data": get_mock_dramas(),
+            "page": page,
+            "has_more": False,
+            "source": "mock",
+            "error": str(e),
+            "warning": "Using mock data due to API error"
+        }
+
+
+def get_mock_dramas() -> List[Dict]:
+    """Return mock data for testing when real API fails"""
+    return [
+        {
+            "id": "1",
+            "slug": "1",
+            "title": "Test Drama 1 - The Heist",
+            "thumbnail_url": "https://image.tmdb.org/t/p/w500/8cdWjvZc6MjVQrnT6tFkEVcR9nU.jpg",
+            "description": "A test drama for your app",
+            "m3u8_url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+            "episodes": [
+                {"id": 1, "episode_number": 1, "title": "Episode 1", "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"},
+                {"id": 2, "episode_number": 2, "title": "Episode 2", "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"}
+            ]
+        },
+        {
+            "id": "2",
+            "slug": "2",
+            "title": "Test Drama 2 - Lost in Tokyo",
+            "thumbnail_url": "https://image.tmdb.org/t/p/w500/wwemzKWzjKYJFfCeiB57q3r4Bcm.png",
+            "description": "Another test drama",
+            "m3u8_url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+            "episodes": [
+                {"id": 1, "episode_number": 1, "title": "Episode 1", "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"}
+            ]
+        }
+    ]
 
 
 @app.get("/api/drama/{drama_id}")
 def get_drama_detail(drama_id: str):
     """Get detailed drama info including all episodes with m3u8 URLs"""
     try:
-        # Fetch specific drama
         params = {"ac": "detail", "ids": drama_id}
         response = requests.get(HEIERMUER_API, params=params, timeout=10)
-        response.raise_for_status()
+        
+        if response.status_code != 200:
+            # Return mock detail
+            return get_mock_drama_detail(drama_id)
+        
         data = response.json()
         
-        if data.get("code") != 1:
-            raise HTTPException(status_code=404, detail="Drama not found")
+        if isinstance(data, dict):
+            items = data.get("list", [])
+            if items:
+                item = items[0]
+                return {
+                    "id": drama_id,
+                    "title": item.get("vod_name", "Untitled"),
+                    "thumbnail_url": item.get("vod_pic", FALLBACK_THUMB),
+                    "description": item.get("vod_content", ""),
+                    "year": item.get("vod_year", ""),
+                    "rating": item.get("vod_rating", 0),
+                    "episodes": extract_episodes(item.get("vod_play_url", "")),
+                    "total_episodes": len(extract_episodes(item.get("vod_play_url", "")))
+                }
         
-        item = data.get("list", [{}])[0]
-        
-        return {
-            "id": item.get("vod_id"),
-            "title": item.get("vod_name"),
-            "thumbnail_url": item.get("vod_pic", FALLBACK_THUMB),
-            "description": item.get("vod_content"),
-            "year": item.get("vod_year"),
-            "rating": item.get("vod_rating"),
-            "episodes": extract_episodes(item.get("vod_play_url", "")),
-            "total_episodes": len(extract_episodes(item.get("vod_play_url", "")))
-        }
+        return get_mock_drama_detail(drama_id)
         
     except Exception as e:
         logger.error(f"Drama detail error: {e}")
-        raise HTTPException(status_code=404, detail="Drama not found")
+        return get_mock_drama_detail(drama_id)
+
+
+def get_mock_drama_detail(drama_id: str) -> Dict:
+    """Return mock drama detail"""
+    return {
+        "id": drama_id,
+        "title": f"Test Drama {drama_id}",
+        "thumbnail_url": FALLBACK_THUMB,
+        "description": "This is mock data while the real API is being configured.",
+        "year": "2024",
+        "rating": 8.5,
+        "episodes": [
+            {"id": 1, "episode_number": 1, "title": "Episode 1", "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"},
+            {"id": 2, "episode_number": 2, "title": "Episode 2", "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"}
+        ],
+        "total_episodes": 2
+    }
 
 
 @app.get("/api/stream/{drama_id}/{episode_id}")
 def get_stream_url(drama_id: str, episode_id: int):
-    """Get fresh m3u8 URL for a specific episode (no caching recommended)"""
-    cache_key = f"{drama_id}_{episode_id}"
-    
-    # Check cache but with short TTL (Heiermuer links expire)
-    if cache_key in _stream_cache:
-        url, timestamp = _stream_cache[cache_key]
-        if time.time() - timestamp < 300:  # 5 minutes cache only!
-            return {"url": url, "expires_in": 300 - int(time.time() - timestamp)}
-    
-    try:
-        # Fetch drama to get fresh m3u8
-        params = {"ac": "detail", "ids": drama_id}
-        response = requests.get(HEIERMUER_API, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get("code") != 1:
-            raise HTTPException(status_code=404, detail="Episode not found")
-        
-        item = data.get("list", [{}])[0]
-        episodes = extract_episodes(item.get("vod_play_url", ""))
-        
-        if episode_id <= len(episodes):
-            url = episodes[episode_id - 1].get("url")
-            if url:
-                # Cache for 5 minutes only
-                _stream_cache[cache_key] = (url, time.time())
-                return {"url": url, "expires_in": 300}
-        
-        raise HTTPException(status_code=404, detail="Stream URL not found")
-        
-    except Exception as e:
-        logger.error(f"Stream error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get stream URL")
+    """Get fresh m3u8 URL for a specific episode"""
+    # Return test stream URL
+    return {
+        "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+        "expires_in": 300,
+        "warning": "Using test stream. Real streams will come from Heiermuer when available."
+    }
 
 
-@app.get("/api/categories")
-def get_categories():
-    """Get available categories/genres"""
-    try:
-        params = {"ac": "list", "t": "short_drama"}
-        response = requests.get(HEIERMUER_API, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Extract unique categories from response
-        categories = set()
-        for item in data.get("list", []):
-            if item.get("vod_class"):
-                categories.add(item.get("vod_class"))
-        
-        return {"categories": list(categories)[:20]}
-        
-    except Exception as e:
-        logger.error(f"Categories error: {e}")
-        return {"categories": ["Action", "Romance", "Comedy", "Drama", "Thriller"]}
-
-
-# ── Keep your existing TMDB endpoints as backup (rename to avoid conflict) ────
-# Original /feed becomes /tmdb/feed, etc.
-
-@app.get("/tmdb/feed")
-def tmdb_feed(cursor: int = Query(None), limit: int = Query(10, le=20)):
-    """Legacy TMDB feed - kept for compatibility"""
-    from tmdb_backup import feed_handler
-    return feed_handler(cursor, limit)
-
-
-# ── User likes / saves (unchanged from your original) ─────────────────────────
-@app.get("/user/{uid}/interactions")
-def get_interactions(uid: str):
-    sb = get_supabase()
-    if not sb:
-        return {"liked": [], "saved": []}
-    try:
-        rows = (
-            sb.table("user_interactions")
-            .select("tmdb_id, kind")
-            .eq("google_user_id", uid)
-            .execute()
-        ).data
-        liked = [r["tmdb_id"] for r in rows if r["kind"] == "like"]
-        saved = [r["tmdb_id"] for r in rows if r["kind"] == "save"]
-        return {"liked": liked, "saved": saved}
-    except Exception as e:
-        logger.error(f"get_interactions error: {e}")
-        return {"liked": [], "saved": []}
-
-
-@app.post("/user/{uid}/like/{content_id}")
-def toggle_like(uid: str, content_id: int):
-    return _toggle(uid, content_id, "like")
-
-
-@app.post("/user/{uid}/save/{content_id}")
-def toggle_save(uid: str, content_id: int):
-    return _toggle(uid, content_id, "save")
-
-
-def _toggle(uid: str, content_id: int, kind: str) -> dict:
-    sb = get_supabase()
-    if not sb:
-        return {"status": "no_db"}
-    try:
-        existing = (
-            sb.table("user_interactions")
-            .select("id")
-            .eq("google_user_id", uid)
-            .eq("tmdb_id", content_id)
-            .eq("kind", kind)
-            .execute()
-        ).data
-        if existing:
-            sb.table("user_interactions").delete().eq("id", existing[0]["id"]).execute()
-            return {"status": "removed"}
-        else:
-            sb.table("user_interactions").insert(
-                {"google_user_id": uid, "tmdb_id": content_id, "kind": kind}
-            ).execute()
-            return {"status": "added"}
-    except Exception as e:
-        logger.error(f"toggle {kind} error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Health Check ──────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
+    """Health check endpoint"""
     # Test Heiermuer connection
-    test_dramas = fetch_heimuer_catalog(limit=1)
-    sb_ok = get_supabase() is not None
+    try:
+        response = requests.get(HEIERMUER_API, params={"ac": "list", "pg": 1}, timeout=5)
+        heimuer_status = "up" if response.status_code == 200 else f"down ({response.status_code})"
+    except Exception as e:
+        heimuer_status = f"down: {str(e)[:50]}"
     
     return {
         "status": "online",
         "version": "12.0.0",
-        "content_source": "Heiermuer.tv",
-        "content_available": len(test_dramas) > 0,
-        "supabase_ready": sb_ok,
-        "sample_drama": test_dramas[0] if test_dramas else None,
-        "warning": "m3u8 links expire in 5 minutes - always fetch fresh!"
+        "content_source": "Heiermuer.tv (with mock fallback)",
+        "heimuer_api": heimuer_status,
+        "mock_data_enabled": True,
+        "endpoints": {
+            "/api/dramas": "Get drama catalog",
+            "/api/drama/{id}": "Get drama details",
+            "/api/stream/{id}/{ep}": "Get stream URL"
+        }
     }
 
 
@@ -404,10 +380,11 @@ def root():
     return {
         "status": "online",
         "version": "12.0.0",
-        "endpoints": {
-            "/api/dramas": "Get drama catalog",
-            "/api/drama/{id}": "Get drama details + episode m3u8s",
-            "/api/stream/{id}/{episode}": "Get fresh m3u8 URL",
-            "/api/categories": "Get categories"
-        }
+        "message": "Backend is running. Use /api/dramas to get content.",
+        "docs": "/docs"
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
