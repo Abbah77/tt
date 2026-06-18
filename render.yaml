@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: reelz-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GOOGLE_CLIENT_ID
+        sync: false          # Set manually in Render dashboard
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_WEBHOOK_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false          # Paste from Supabase (Transaction pooler URL)
+    healthCheckPath: /health
+    autoDeploy: true
