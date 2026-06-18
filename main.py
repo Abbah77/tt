@@ -1,414 +1,444 @@
 """
-ReelzLite Backend  –  main.py
-==============================
-Serves public-domain movies from archive.org as 5-minute episodes,
-matching the Dart app's ApiService contract exactly:
-
-  GET /feed?cursor=<int>&limit=<int>   → FeedResponse
-  GET /movie/<slug>                    → MovieDetail  (with episodes)
-  GET /search?q=<str>&limit=<int>      → { "data": [MovieCard] }
-  GET /                                → health check
-
-Episode strategy (no ffmpeg needed)
-------------------------------------
-archive.org serves MP4 files that support HTTP Range and time-fragment
-URIs via the media fragment standard:
-    https://archive.org/download/<id>/file.mp4#t=0,300
-Most video players (including Flutter's video_player / chewie) honour
-the #t= fragment to auto-seek and stop.  We compute N episodes of
-EPISODE_SECONDS each, each carrying:
-  • stream_url  – direct MP4 URL with #t=start,end fragment
-  • start_time  – seconds into the source file
-  • end_time    – seconds into the source file
-  • duration    – seconds (capped at EPISODE_SECONDS)
-
-The Flutter side just passes startAt=start_time when it opens the
-player and stops / auto-advances at end_time.
-
-Duration estimation
--------------------
-archive.org metadata often carries a "length" or "runtime" field.
-We parse those; if absent we estimate from file size (≈1.5 Mbit/s
-for typical SD MP4, a conservative estimate that avoids showing
-episodes beyond EOF).
+Reelz Backend — FastAPI + Supabase PostgreSQL
+==============================================
+4 endpoints only. Webhook is source of truth.
+Local-first: app caches everything, backend is only hit:
+  1. On sign-in (POST /auth/google)
+  2. After payment (GET /subscription/status)
+  3. On Paystack webhook (POST /webhook/paystack)
+  4. On payment init (POST /payments/init)
 """
 
-from __future__ import annotations
-
-import asyncio
-import re
-from typing import Optional
+import hashlib
+import hmac
+import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-# ── constants ─────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reelz")
 
-EPISODE_SECONDS = 300          # 5 minutes per episode
-BITRATE_ESTIMATE = 1_500_000  # bits/s fallback for size→duration
-MIN_DURATION = 300             # discard clips shorter than 5 min
+# ── Env ───────────────────────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID        = os.environ["GOOGLE_CLIENT_ID"]        # Your Android client ID
+PAYSTACK_SECRET_KEY     = os.environ["PAYSTACK_SECRET_KEY"]     # sk_live_... or sk_test_...
+DATABASE_URL            = os.environ["DATABASE_URL"]            # postgres://... from Supabase
+PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
-ARCHIVE_SEARCH = "https://archive.org/advancedsearch.php"
-ARCHIVE_META   = "https://archive.org/metadata"
-ARCHIVE_DOWN   = "https://archive.org/download"
-ARCHIVE_IMG    = "https://archive.org/services/img"
-
-# Collections most likely to have full-length public-domain movies
-FEED_QUERIES = [
-    'collection:feature_films AND mediatype:movies',
-    'collection:PublicDomainMovies AND mediatype:movies',
-    'collection:moviesandfilms AND mediatype:movies',
-    'mediatype:movies AND subject:"public domain" AND format:mp4',
-]
-
-SEARCH_QUERY_TMPL = (
-    'mediatype:movies AND ({q}) AND (collection:feature_films OR '
-    'collection:PublicDomainMovies OR collection:moviesandfilms)'
-)
-
-# ── app setup ─────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="ReelzLite Backend")
-
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Reelz API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-client = httpx.AsyncClient(timeout=30)
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
-# Simple in-process cache: identifier → metadata dict
-_meta_cache: dict[str, dict] = {}
-
-
-# ── archive.org helpers ───────────────────────────────────────────────────────
-
-async def search_archive(q: str, rows: int = 50) -> list[dict]:
-    """Call the archive.org Lucene search API."""
-    try:
-        r = await client.get(ARCHIVE_SEARCH, params={
-            "q":     q,
-            "fl[]": ["identifier", "title", "description", "year",
-                     "subject", "runtime", "length"],
-            "rows":  rows,
-            "page":  1,
-            "output": "json",
-        })
-        r.raise_for_status()
-        docs = r.json().get("response", {}).get("docs", [])
-        return [d for d in docs if d.get("identifier") and d.get("title")]
-    except Exception:
-        return []
-
-
-async def get_meta(identifier: str) -> dict:
-    """Fetch item metadata, with a simple in-process cache."""
-    if identifier in _meta_cache:
-        return _meta_cache[identifier]
-    r = await client.get(f"{ARCHIVE_META}/{identifier}")
-    r.raise_for_status()
-    data = r.json()
-    _meta_cache[identifier] = data
-    return data
-
-
-# ── duration helpers ──────────────────────────────────────────────────────────
-
-_RUNTIME_RE = re.compile(
-    r"(?:(\d+)\s*h(?:r|ours?)?)?\s*(?:(\d+)\s*m(?:in)?s?)?\s*(?:(\d+)\s*s(?:ec)?s?)?",
-    re.IGNORECASE,
-)
-
-
-def _parse_runtime(raw: str | list | None) -> int | None:
+def get_conn():
     """
-    Convert archive.org 'runtime' / 'length' strings to total seconds.
-    Handles: "1:32:00", "92 min", "1h 32m", "5520" (bare seconds).
+    Open a fresh connection per request.
+    Render's free tier keeps the process alive, so a connection pool would
+    work, but fresh connections are simpler and safe given low traffic.
     """
-    if raw is None:
-        return None
-    if isinstance(raw, list):
-        raw = raw[0]
-    raw = str(raw).strip()
-
-    # HH:MM:SS or MM:SS
-    parts = raw.split(":")
-    if len(parts) in (2, 3):
-        try:
-            nums = [int(p) for p in parts]
-            if len(nums) == 3:
-                return nums[0] * 3600 + nums[1] * 60 + nums[2]
-            return nums[0] * 60 + nums[1]
-        except ValueError:
-            pass
-
-    # bare integer (seconds)
-    if raw.isdigit():
-        return int(raw)
-
-    # "92 min" / "1h 32m 10s"
-    m = _RUNTIME_RE.fullmatch(raw)
-    if m:
-        h, mi, s = (int(x) if x else 0 for x in m.groups())
-        total = h * 3600 + mi * 60 + s
-        if total > 0:
-            return total
-
-    return None
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
-def _estimate_duration(files: list[dict], identifier: str) -> int | None:
+def init_db():
+    """Create tables if they don't exist. Runs at startup."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    google_sub   TEXT UNIQUE NOT NULL,
+                    email        TEXT NOT NULL,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id                   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    status                    TEXT NOT NULL DEFAULT 'expired',
+                    expires_at                TIMESTAMPTZ,
+                    paystack_customer_code    TEXT,
+                    paystack_subscription_code TEXT,
+                    updated_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
+                CREATE INDEX IF NOT EXISTS idx_users_google_sub     ON users(google_sub);
+            """)
+        conn.commit()
+    log.info("DB tables ensured")
+
+
+@app.on_event("startup")
+async def startup():
+    init_db()
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+
+class PaymentInitRequest(BaseModel):
+    user_id: str          # UUID from the app's local session
+    plan: str             # "monthly" | "yearly"
+    email: str            # Shown on Paystack checkout (from Google, not trusted for auth)
+
+
+class SubscriptionStatusRequest(BaseModel):
+    user_id: str
+
+
+# ── Helper: verify Google ID token ───────────────────────────────────────────
+
+async def verify_google_token(id_token: str) -> dict:
     """
-    Try to get duration from file metadata fields, then fall back
-    to estimating from file size.
+    Calls Google's tokeninfo endpoint. Returns the decoded claims or raises.
+    For production volume, use google-auth library instead.
     """
-    best_size = 0
-    best_duration = None
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": id_token},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
 
-    for f in files:
-        name: str = (f.get("name") or "").lower()
-        if not name.endswith((".mp4", ".ogv", ".avi", ".mkv")):
-            continue
-        if any(x in name for x in ("sample", "trailer", "64kb", "512kb")):
-            continue
+    claims = resp.json()
 
-        # Length field on the file object
-        d = _parse_runtime(f.get("length")) or _parse_runtime(f.get("runtime"))
-        if d and d > best_duration or (best_duration is None and d):
-            best_duration = d
+    # Validate audience — must match your Android client ID
+    aud = claims.get("aud", "")
+    if GOOGLE_CLIENT_ID not in (aud if isinstance(aud, list) else [aud]):
+        log.warning("Token audience mismatch: %s", aud)
+        raise HTTPException(status_code=401, detail="Token audience mismatch")
 
-        # Track largest video file for size-based fallback
-        try:
-            sz = int(f.get("size", 0))
-            if sz > best_size:
-                best_size = sz
-        except (ValueError, TypeError):
-            pass
+    # Token must not be expired
+    exp = int(claims.get("exp", 0))
+    if datetime.now(timezone.utc).timestamp() > exp:
+        raise HTTPException(status_code=401, detail="Token expired")
 
-    if best_duration and best_duration >= MIN_DURATION:
-        return best_duration
-
-    # Size-based estimate
-    if best_size > 0:
-        est = int((best_size * 8) / BITRATE_ESTIMATE)
-        if est >= MIN_DURATION:
-            return est
-
-    return None
+    return claims
 
 
-# ── video file selection ───────────────────────────────────────────────────────
+# ── Helper: read subscription ─────────────────────────────────────────────────
 
-def pick_video_file(files: list[dict]) -> dict | None:
+def _get_subscription(cur, user_id: str) -> dict | None:
+    cur.execute(
+        "SELECT * FROM subscriptions WHERE user_id = %s ORDER BY updated_at DESC LIMIT 1",
+        (user_id,),
+    )
+    return cur.fetchone()
+
+
+def _subscription_response(sub: dict | None) -> dict:
     """
-    Return the best video file dict from the archive.org files list.
-    Prefers mp4 > ogv > avi > mkv; skips sample/trailer/low-quality copies.
+    Normalise to the shape the app expects.
+    Fail SAFE toward free: any ambiguity returns premium=false.
     """
-    SKIP = ("sample", "trailer", "64kb", "512kb", "256kb")
-    for ext in ("mp4", "ogv", "avi", "mkv"):
-        for f in files:
-            name: str = (f.get("name") or "").lower()
-            if name.endswith(f".{ext}") and not any(x in name for x in SKIP):
-                return f
-    return None
+    if sub is None:
+        return {"premium": False, "status": "none", "expires_at": None}
 
+    now = datetime.now(timezone.utc)
+    expires_at: datetime | None = sub.get("expires_at")
+    status = sub.get("status", "expired")
 
-def thumb_url(identifier: str) -> str:
-    return f"{ARCHIVE_IMG}/{identifier}"
-
-
-# ── model builders ────────────────────────────────────────────────────────────
-
-def build_movie_card(doc: dict, episode_count: int = 1) -> dict:
-    """
-    Build the MovieCard JSON the Dart app expects.
-    Keys must exactly match MovieCard.fromJson() in models.dart:
-      id, title, slug, thumbnail_url, trailer_url
-    slug == archive.org identifier (used as /movie/<slug>).
-    id   == stable hash of identifier (Dart expects int, not string).
-    """
-    ident  = doc.get("identifier", "")
-    subj   = doc.get("subject", "")
-    genre  = (", ".join(subj[:3]) if isinstance(subj, list) else str(subj or ""))[:60]
-    desc   = doc.get("description", "") or ""
-    if isinstance(desc, list):
-        desc = " ".join(desc)
-
-    # Dart MovieCard requires an int id — use a stable hash of the identifier
-    card_id = abs(hash(ident)) % (10 ** 9)
-
-    return {
-        # ── Fields read by MovieCard.fromJson ──
-        "id":            card_id,
-        "title":         doc.get("title", ident),
-        "slug":          ident,
-        "thumbnail_url": thumb_url(ident),   # ← was "thumbnail" (wrong key)
-        "trailer_url":   None,                # feed cards have no separate trailer
-        # ── Extra fields (ignored by Dart but useful for debugging) ──
-        "year":          str(doc.get("year", "")),
-        "genre":         genre,
-        "description":   desc[:300],
-        "episode_count": episode_count,
-    }
-
-
-def build_episodes(identifier: str, video_file: dict, total_seconds: int) -> list[dict]:
-    """
-    Slice a movie into 5-minute episode dicts.
-    Keys must exactly match EpisodeModel.fromJson() in models.dart:
-      id, episode_number, url
-    Each episode carries a #t=start,end fragment so media_kit seeks correctly.
-    """
-    fname    = video_file["name"]
-    base_url = f"{ARCHIVE_DOWN}/{identifier}/{fname}"
-    episodes = []
-    ep_num   = 1
-    start    = 0
-
-    while start < total_seconds:
-        end = min(start + EPISODE_SECONDS, total_seconds)
-
-        episodes.append({
-            # ── Fields read by EpisodeModel.fromJson ──
-            "id":             ep_num,                       # ← Dart needs int id
-            "episode_number": ep_num,                       # ← was "episode" (wrong key)
-            "url":            f"{base_url}#t={start},{end}", # ← was "stream_url" (wrong key)
-            # ── Extra fields for the player to use ──
-            "start_time": start,
-            "end_time":   end,
-            "duration":   end - start,
-            "title":      f"Episode {ep_num}",
-        })
-
-        start  += EPISODE_SECONDS
-        ep_num += 1
-
-    return episodes
-
-
-# ── routes ────────────────────────────────────────────────────────────────────
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "ReelzLite Backend"}
-
-
-@app.get("/feed")
-async def feed(
-    cursor: Optional[int] = Query(None),
-    limit:  int           = Query(10, ge=1, le=50),
-):
-    """
-    Paginated feed of MovieCards.
-    cursor = offset into the master list (None → 0).
-    Returns: { data: [MovieCard], next_cursor: int|null, has_more: bool }
-    """
-    offset = cursor or 0
-
-    # Fetch enough results to satisfy the page
-    need   = offset + limit
-    rows   = max(need + 10, 60)          # over-fetch slightly
-
-    docs: list[dict] = []
-    for q in FEED_QUERIES:
-        if len(docs) >= need:
-            break
-        batch = await search_archive(q, rows=rows)
-        # dedupe by identifier
-        seen  = {d["identifier"] for d in docs}
-        docs += [d for d in batch if d["identifier"] not in seen]
-
-    page     = docs[offset: offset + limit]
-    has_more = len(docs) > offset + limit
-    nxt      = (offset + limit) if has_more else None
-
-    # For card list we don't fetch full metadata — estimate episodes from
-    # a quick heuristic (archive search has no duration field, so default 12).
-    cards = [build_movie_card(d, episode_count=12) for d in page]
-
-    return {
-        "data":        cards,
-        "next_cursor": nxt,
-        "has_more":    has_more,
-    }
-
-
-@app.get("/search")
-async def search(
-    q:     str = Query(..., min_length=1),
-    limit: int = Query(20, ge=1, le=50),
-):
-    """
-    Free-text search against archive.org.
-    Returns: { "data": [MovieCard] }
-    """
-    query = SEARCH_QUERY_TMPL.format(q=q)
-    docs  = await search_archive(query, rows=limit + 10)
-    cards = [build_movie_card(d, episode_count=12) for d in docs[:limit]]
-    return {"data": cards}
-
-
-@app.get("/movie/{slug:path}")
-async def movie_detail(slug: str):
-    """
-    Full MovieDetail for one item, with real episode list.
-    Returns: { movie: MovieCard, episodes: [Episode] }
-
-    This is the expensive call — it fetches archive.org metadata to get
-    the actual video URL and compute real episode boundaries.
-    """
-    try:
-        meta  = await get_meta(slug)
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(404, f"Not found on archive.org: {slug}") from e
-    except Exception as e:
-        raise HTTPException(502, f"archive.org error: {e}") from e
-
-    files     = meta.get("files", [])
-    m         = meta.get("metadata", {})
-    video_f   = pick_video_file(files)
-
-    if not video_f:
-        raise HTTPException(404, f"No playable video file for: {slug}")
-
-    # Duration: prefer metadata fields, then file-level, then size estimate
-    total_secs = (
-        _parse_runtime(m.get("runtime"))
-        or _parse_runtime(m.get("length"))
-        or _estimate_duration(files, slug)
+    # Grace period = 24 hours after expiry
+    in_grace = (
+        expires_at is not None
+        and expires_at < now
+        and (now - expires_at) < timedelta(hours=24)
     )
 
-    if not total_secs or total_secs < MIN_DURATION:
-        # Too short to bother splitting — serve as single episode
-        total_secs = EPISODE_SECONDS
-
-    episodes = build_episodes(slug, video_f, total_secs)
-
-    subj  = m.get("subject", "")
-    genre = (", ".join(subj[:3]) if isinstance(subj, list) else str(subj or ""))[:60]
-    desc  = m.get("description", "") or ""
-    if isinstance(desc, list):
-        desc = " ".join(desc)
-
-    card = {
-        # ── Fields read by MovieCard.fromJson ──
-        "id":            abs(hash(slug)) % (10 ** 9),
-        "title":         m.get("title", slug),
-        "slug":          slug,
-        "thumbnail_url": thumb_url(slug),   # ← correct key
-        "trailer_url":   None,
-        # ── Extra fields ──
-        "year":          str(m.get("year", "")),
-        "genre":         genre,
-        "description":   desc[:300],
-        "episode_count": len(episodes),
-    }
+    is_premium = (
+        status == "active"
+        and expires_at is not None
+        and (expires_at > now or in_grace)
+    )
 
     return {
-        "movie":          card,
-        "episodes":       episodes,
-        "total_episodes": len(episodes),   # ← Dart MovieDetail.fromJson reads this
+        "premium":    is_premium,
+        "status":     status,
+        "expires_at": expires_at.isoformat() if expires_at else None,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENDPOINT 1 — POST /auth/google
+# Called once per sign-in. Returns premium status from DB.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/auth/google")
+async def auth_google(body: GoogleAuthRequest):
+    """
+    1. Verify token with Google (source of truth for identity).
+    2. Upsert user row by google_sub (never by email — email can change).
+    3. Return user_id + current subscription status.
+
+    The app saves this locally. It will NOT call this endpoint again until
+    the user explicitly signs in again.
+    """
+    claims = await verify_google_token(body.id_token)
+
+    google_sub: str = claims["sub"]   # permanent, never changes
+    email: str = claims.get("email", "").lower().strip()
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Upsert user — use google_sub as the unique key
+            cur.execute("""
+                INSERT INTO users (google_sub, email)
+                VALUES (%s, %s)
+                ON CONFLICT (google_sub) DO UPDATE SET email = EXCLUDED.email
+                RETURNING id
+            """, (google_sub, email))
+            user = cur.fetchone()
+            user_id = str(user["id"])
+
+            # Read latest subscription
+            sub = _get_subscription(cur, user_id)
+        conn.commit()
+
+    log.info("auth/google: sub=%s user_id=%s", google_sub[:8], user_id[:8])
+    return {"user_id": user_id, **_subscription_response(sub)}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENDPOINT 2 — POST /payments/init
+# Creates a Paystack transaction and returns the checkout URL.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Prices in kobo (1 NGN = 100 kobo)
+PLAN_AMOUNTS = {
+    "monthly": 150_000,   # ₦1,500
+    "yearly":  1_200_000, # ₦12,000
+}
+
+@app.post("/payments/init")
+async def payments_init(body: PaymentInitRequest):
+    """
+    Initialises a Paystack transaction server-side.
+    The app opens the returned authorization_url in an in-app browser.
+    The webhook (not this response) is the source of truth.
+    """
+    if body.plan not in PLAN_AMOUNTS:
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
+
+    amount = PLAN_AMOUNTS[body.plan]
+
+    payload = {
+        "email":     body.email,
+        "amount":    amount,
+        "currency":  "NGN",
+        "metadata": {
+            "user_id":    body.user_id,
+            "plan":       body.plan,
+            "custom_fields": [
+                {"display_name": "Plan",    "variable_name": "plan",    "value": body.plan},
+                {"display_name": "User ID", "variable_name": "user_id", "value": body.user_id},
+            ],
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            "https://api.paystack.co/transaction/initialize",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"},
+            json=payload,
+        )
+
+    if resp.status_code != 200:
+        log.error("Paystack init failed: %s", resp.text)
+        raise HTTPException(status_code=502, detail="Payment provider error")
+
+    data = resp.json()
+    if not data.get("status"):
+        raise HTTPException(status_code=502, detail=data.get("message", "Paystack error"))
+
+    return {
+        "authorization_url": data["data"]["authorization_url"],
+        "reference":         data["data"]["reference"],
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENDPOINT 3 — GET /subscription/status
+# Called in background: on app launch (if >24h since last check) and after payment.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.get("/subscription/status")
+async def subscription_status(user_id: str):
+    """
+    Lightweight read-only endpoint.
+    The app calls this at most:
+      - Once at launch (only if >24h since last check, checked locally)
+      - Once after the user pays
+    Never called per-screen.
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id required")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Verify user exists
+            cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="User not found")
+            sub = _get_subscription(cur, user_id)
+
+    return _subscription_response(sub)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENDPOINT 4 — POST /webhook/paystack
+# Paystack calls this directly. This is the ONLY place subscriptions activate.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.post("/webhook/paystack")
+async def webhook_paystack(request: Request):
+    """
+    Source of truth for all payment events.
+    Verifies the Paystack HMAC signature before touching the DB.
+    Returns 200 immediately — Paystack retries on non-200.
+    """
+    body_bytes = await request.body()
+    signature  = request.headers.get("x-paystack-signature", "")
+
+    # ── 1. Verify HMAC signature ──────────────────────────────────────────
+    expected = hmac.new(
+        PAYSTACK_WEBHOOK_SECRET.encode(),
+        body_bytes,
+        hashlib.sha512,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, signature):
+        log.warning("Webhook signature mismatch — ignoring")
+        # Return 200 so Paystack doesn't keep retrying a bad secret
+        return Response(status_code=200)
+
+    # ── 2. Parse event ────────────────────────────────────────────────────
+    try:
+        event = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        log.error("Webhook: invalid JSON")
+        return Response(status_code=200)
+
+    event_type = event.get("event", "")
+    data       = event.get("data", {})
+    log.info("Webhook received: %s", event_type)
+
+    # ── 3. Handle charge.success ──────────────────────────────────────────
+    if event_type == "charge.success":
+        await _handle_charge_success(data)
+
+    # ── 4. Handle subscription.disable / cancel ───────────────────────────
+    elif event_type in ("subscription.disable", "subscription.not_renew"):
+        await _handle_subscription_cancel(data)
+
+    return Response(status_code=200)
+
+
+async def _handle_charge_success(data: dict):
+    """Activate or renew the subscription for this payment."""
+    metadata = data.get("metadata", {})
+    user_id  = metadata.get("user_id", "")
+    plan     = metadata.get("plan", "monthly")
+
+    # Fall back: try custom_fields list
+    if not user_id:
+        for field in metadata.get("custom_fields", []):
+            if field.get("variable_name") == "user_id":
+                user_id = field.get("value", "")
+            if field.get("variable_name") == "plan":
+                plan = field.get("value", "monthly")
+
+    if not user_id:
+        log.error("charge.success: no user_id in metadata — %s", metadata)
+        return
+
+    # Calculate expiry
+    plan_days = 365 if plan == "yearly" else 31
+    expires_at = datetime.now(timezone.utc) + timedelta(days=plan_days)
+
+    customer_code      = data.get("customer", {}).get("customer_code", "")
+    subscription_code  = data.get("subscription_code", "")  # present on recurring charges
+    reference          = data.get("reference", "")
+
+    log.info(
+        "Activating premium: user_id=%s plan=%s expires=%s ref=%s",
+        user_id[:8], plan, expires_at.date(), reference,
+    )
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Verify user exists before writing
+                cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+                if cur.fetchone() is None:
+                    log.error("charge.success: unknown user_id=%s", user_id)
+                    return
+
+                # Upsert subscription
+                cur.execute("""
+                    INSERT INTO subscriptions
+                        (user_id, status, expires_at, paystack_customer_code,
+                         paystack_subscription_code, updated_at)
+                    VALUES (%s, 'active', %s, %s, %s, now())
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET
+                        status                     = 'active',
+                        expires_at                 = EXCLUDED.expires_at,
+                        paystack_customer_code     = EXCLUDED.paystack_customer_code,
+                        paystack_subscription_code = EXCLUDED.paystack_subscription_code,
+                        updated_at                 = now()
+                """, (user_id, expires_at, customer_code, subscription_code))
+
+            conn.commit()
+        log.info("Premium activated for user_id=%s", user_id[:8])
+    except Exception as exc:
+        log.exception("DB error activating subscription: %s", exc)
+
+
+# Add UNIQUE constraint helper (idempotent)
+# NOTE: Run this migration once in Supabase SQL editor:
+#   ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_user_id_unique UNIQUE (user_id);
+# The ON CONFLICT clause above requires it.
+
+
+async def _handle_subscription_cancel(data: dict):
+    """Mark subscription as cancelled when Paystack disables it."""
+    subscription_code = data.get("subscription_code", "")
+    if not subscription_code:
+        return
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE subscriptions SET status = 'cancelled', updated_at = now()
+                    WHERE paystack_subscription_code = %s
+                """, (subscription_code,))
+            conn.commit()
+        log.info("Subscription cancelled: %s", subscription_code)
+    except Exception as exc:
+        log.exception("DB error cancelling subscription: %s", exc)
+
+
+# ── Health check ──────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
