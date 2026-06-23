@@ -30,7 +30,12 @@ PAYSTACK_SECRET_KEY     = os.environ["PAYSTACK_SECRET_KEY"]
 DATABASE_URL            = os.environ["DATABASE_URL"]
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
-app = FastAPI(title="Reelz API", version="1.2.0")
+# How long a cached feed slug is considered "fresh" before we trigger a
+# background refresh. Stale entries are still served instantly — the user
+# never pays the scrape latency after the very first load for a slug.
+FEED_CACHE_TTL_SECONDS = 10 * 60  # 10 minutes
+
+app = FastAPI(title="Reelz API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,6 +69,12 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
                 CREATE INDEX IF NOT EXISTS idx_users_google_sub      ON users(google_sub);
+
+                CREATE TABLE IF NOT EXISTS feed_cache (
+                    slug       TEXT PRIMARY KEY,
+                    videos     JSONB NOT NULL,
+                    cached_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
             """)
         conn.commit()
     log.info("DB tables ensured")
@@ -234,16 +245,16 @@ async def _handle_subscription_cancel(data: dict):
     except Exception as exc:
         log.exception("DB error cancelling subscription: %s", exc)
 
-# ── ENDPOINT 5: GET /shorts/feed — HTTP Scraper ─────────────────────────────
+# ── ENDPOINT 5: GET /shorts/feed — HTTP Scraper + Postgres cache ────────────
 
 def clean_url(url: str, base_url: str) -> str:
     """Clean and normalize URLs."""
     if not url:
         return ''
-    
+
     # Remove whitespace
     url = url.strip()
-    
+
     # Handle relative URLs
     if url.startswith('//'):
         return 'https:' + url
@@ -251,7 +262,7 @@ def clean_url(url: str, base_url: str) -> str:
         return urljoin(base_url, url)
     elif not url.startswith('http'):
         return urljoin(base_url, url)
-    
+
     return url
 
 async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
@@ -260,7 +271,7 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
     """
     url = f"{base_url}/community/{slug}"
     log.info(f"Scraping: {url}")
-    
+
     try:
         async with httpx.AsyncClient(
             timeout=30,
@@ -277,38 +288,38 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
             }
         ) as client:
             resp = await client.get(url)
-            
+
             if resp.status_code != 200:
                 log.warning(f"Failed to fetch {url}: {resp.status_code}")
                 return []
-            
+
             html = resp.text
             soup = BeautifulSoup(html, 'html.parser')
-            
+
             videos = []
             seen_urls = set()
-            
+
             # Find all video elements
             video_elements = soup.find_all('video')
             log.info(f"Found {len(video_elements)} video elements")
-            
+
             for video in video_elements:
                 # Get video source from various attributes
                 src = video.get('src', '')
-                
+
                 # Check for source tags
                 if not src:
                     source = video.find('source')
                     if source:
                         src = source.get('src', '')
-                
+
                 # Check data attributes
                 if not src:
                     for attr in ['data-src', 'data-video', 'data-url', 'data-href']:
                         if video.get(attr):
                             src = video.get(attr)
                             break
-                
+
                 # Get poster/thumbnail
                 poster = video.get('poster', '')
                 if not poster:
@@ -316,7 +327,7 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         if video.get(attr):
                             poster = video.get(attr)
                             break
-                
+
                 # Try to get video ID from parent links
                 video_id = f"vid_{len(videos)}"
                 parent = video.parent
@@ -333,19 +344,19 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                     if video_id != f"vid_{len(videos)}":
                         break
                     parent = parent.parent
-                
+
                 # Clean URL
                 if src:
                     src = clean_url(src, base_url)
-                    
+
                     if '.mp4' in src.lower() or '/video/' in src.lower():
                         if src not in seen_urls:
                             seen_urls.add(src)
-                            
+
                             # Clean poster URL
                             if poster:
                                 poster = clean_url(poster, base_url)
-                            
+
                             # Try to find a title
                             title = ''
                             parent = video.parent
@@ -363,7 +374,7 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                                     title = title_attrs[0].get('title', '')
                                     break
                                 parent = parent.parent
-                            
+
                             videos.append({
                                 'id': video_id,
                                 'mp4': src,
@@ -372,19 +383,19 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                                 'author': slug.split('-')[0].capitalize(),
                                 'community': slug.split('-')[0].capitalize()
                             })
-            
+
             # If no videos found, search HTML for MP4 URLs
             if not videos:
                 log.info("No video tags found, searching HTML for MP4 URLs...")
-                
+
                 # Find all MP4 URLs in HTML
                 mp4_pattern = r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*'
                 mp4_urls = re.findall(mp4_pattern, html)
-                
+
                 for idx, mp4_url in enumerate(mp4_urls[:30]):
                     if mp4_url not in seen_urls:
                         seen_urls.add(mp4_url)
-                        
+
                         # Try to find thumbnail nearby
                         thumb = ''
                         context = html[max(0, html.find(mp4_url) - 500):html.find(mp4_url) + 500]
@@ -392,7 +403,7 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         thumbs = re.findall(thumb_pattern, context)
                         if thumbs:
                             thumb = thumbs[0]
-                        
+
                         videos.append({
                             'id': f"mp4_{idx}",
                             'mp4': mp4_url,
@@ -401,10 +412,10 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                             'author': slug.split('-')[0].capitalize(),
                             'community': slug.split('-')[0].capitalize()
                         })
-            
+
             log.info(f"✓ {slug} → {len(videos)} videos found")
             return videos[:30]
-            
+
     except Exception as e:
         log.exception(f"✗ Failed to scrape {slug}: {e}")
         return []
@@ -426,6 +437,82 @@ def _to_short_video(v: dict) -> dict:
         "height": 0,
     }
 
+# ── Feed cache (Postgres-backed, stale-while-revalidate) ──────────────────────
+#
+# Read path:
+#   1. Cache row missing entirely      -> scrape synchronously, write cache, return fresh
+#   2. Cache row present and fresh     -> return cached immediately
+#   3. Cache row present but stale     -> return cached immediately AND
+#                                          kick off a background refresh for next time
+#
+# This means a real scrape only ever blocks a user request the very first
+# time a slug is ever requested. Every request after that is instant.
+
+# Tracks slugs currently being refreshed in the background so we don't
+# fire duplicate scrapes if multiple requests land while one is in flight.
+_refresh_in_progress: set[str] = set()
+
+def _read_cache(cur, slug: str) -> Optional[dict]:
+    cur.execute("SELECT videos, cached_at FROM feed_cache WHERE slug = %s", (slug,))
+    return cur.fetchone()
+
+def _write_cache(slug: str, videos: list[dict]):
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO feed_cache (slug, videos, cached_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (slug) DO UPDATE SET
+                        videos = EXCLUDED.videos, cached_at = EXCLUDED.cached_at
+                """, (slug, json.dumps(videos)))
+            conn.commit()
+    except Exception:
+        log.exception(f"Failed writing feed cache for slug={slug}")
+
+async def _scrape_and_cache(base_url: str, slug: str) -> list[dict]:
+    videos = await scrape_community_http(base_url, slug)
+    # Shuffle once at write-time so repeated reads within the TTL window
+    # stay in a stable order (no re-shuffling on every loadMore/refresh).
+    random.shuffle(videos)
+    _write_cache(slug, videos)
+    return videos
+
+def _schedule_background_refresh(base_url: str, slug: str):
+    if slug in _refresh_in_progress:
+        return
+    _refresh_in_progress.add(slug)
+
+    async def _run():
+        try:
+            await _scrape_and_cache(base_url, slug)
+            log.info(f"↻ background refresh complete for slug={slug}")
+        finally:
+            _refresh_in_progress.discard(slug)
+
+    asyncio.create_task(_run())
+
+async def get_videos_for_slug(base_url: str, slug: str) -> list[dict]:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            row = _read_cache(cur, slug)
+
+    if row is None:
+        # Never cached before — this request pays the scrape cost once.
+        log.info(f"cache MISS slug={slug} — scraping synchronously")
+        return await _scrape_and_cache(base_url, slug)
+
+    age = (datetime.now(timezone.utc) - row["cached_at"]).total_seconds()
+    videos = row["videos"]
+
+    if age > FEED_CACHE_TTL_SECONDS:
+        log.info(f"cache STALE slug={slug} age={int(age)}s — serving stale + refreshing in background")
+        _schedule_background_refresh(base_url, slug)
+    else:
+        log.info(f"cache HIT slug={slug} age={int(age)}s")
+
+    return videos
+
 @app.get("/shorts/feed")
 async def shorts_feed(
     subs: str = Query(..., description='"+"-separated community slugs'),
@@ -436,8 +523,8 @@ async def shorts_feed(
         raise HTTPException(status_code=400, detail="subs param is required")
 
     slugs = slugs[:5]
-    
-    tasks = [scrape_community_http(base_url, slug) for slug in slugs]
+
+    tasks = [get_videos_for_slug(base_url, slug) for slug in slugs]
     results = await asyncio.gather(*tasks)
 
     merged, seen_urls = [], set()
@@ -447,7 +534,6 @@ async def shorts_feed(
                 seen_urls.add(v["mp4"])
                 merged.append(v)
 
-    random.shuffle(merged)
     log.info(f"shorts/feed → {len(merged)} total videos")
 
     return {"videos": [_to_short_video(v) for v in merged], "count": len(merged)}
