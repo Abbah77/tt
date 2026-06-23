@@ -14,12 +14,12 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 import httpx
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("reelz")
@@ -233,154 +233,162 @@ async def _handle_subscription_cancel(data: dict):
     except Exception as exc:
         log.exception("DB error cancelling subscription: %s", exc)
 
-# ── ENDPOINT 5: GET /shorts/feed — Playwright scraper ────────────────────────
-#
-# ifunny.club is JS-rendered. We use a headless Chromium (Playwright) to:
-#   1. Navigate to the community page
-#   2. Wait for <video> elements to appear in the DOM
-#   3. Extract src + poster attributes
-#   4. Return as ShortVideo-compatible JSON
-#
-# Playwright is run with a shared browser instance (reused across requests).
-# ─────────────────────────────────────────────────────────────────────────────
+# ── ENDPOINT 5: GET /shorts/feed — HTTP Scraper (No Playwright!) ────────────
 
-_playwright_instance = None
-_browser = None
-
-async def get_browser():
-    global _playwright_instance, _browser
-    if _browser is None or not _browser.is_connected():
-        _playwright_instance = await async_playwright().start()
-        _browser = await _playwright_instance.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-first-run",
-                "--no-zygote",
-                "--single-process",
-            ],
-        )
-        log.info("Playwright browser launched")
-    return _browser
-
-@app.on_event("shutdown")
-async def shutdown():
-    global _browser, _playwright_instance
-    if _browser:
-        await _browser.close()
-    if _playwright_instance:
-        await _playwright_instance.stop()
-
-
-async def scrape_community(base_url: str, slug: str) -> list[dict]:
+async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
     """
-    Open the ifunny.club community page in a headless browser,
-    wait for video elements to render, then extract mp4 + poster.
+    Scrape ifunny.club for videos using HTTP requests + BeautifulSoup.
+    No Playwright needed - works on Cloud Shell and Render!
     """
     url = f"{base_url}/community/{slug}"
-    log.info("Scraping: %s", url)
+    log.info(f"Scraping: {url}")
+    
     try:
-        browser = await get_browser()
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-            viewport={"width": 390, "height": 844},
-            extra_http_headers={
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Referer": f"{base_url}/",
-            },
-        )
-        page = await context.new_page()
-
-        # Block images/fonts/css to speed up load — we only need the DOM/JS
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,css}", lambda r: r.abort())
-
-        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-
-        # Wait for at least one <video> to appear (up to 15s)
-        try:
-            await page.wait_for_selector("video", timeout=15_000)
-        except PlaywrightTimeout:
-            log.warning("No <video> elements found on %s", url)
-            await context.close()
-            return []
-
-        # Scroll down a bit to trigger lazy-load
-        for _ in range(3):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await asyncio.sleep(1)
-
-        # Extract all video elements
-        videos = await page.evaluate("""
-            () => {
-                const results = [];
-                document.querySelectorAll('video').forEach((v, i) => {
-                    const src = v.src || v.querySelector('source')?.src || '';
-                    const poster = v.poster || '';
-                    // Walk up to find a post container with a link for the id
-                    let id = '';
-                    let el = v;
-                    for (let d = 0; d < 8; d++) {
-                        el = el.parentElement;
-                        if (!el) break;
-                        const a = el.querySelector('a[href*="/video/"], a[href*="/gif/"], a[href*="/post/"]');
-                        if (a) {
-                            const m = a.href.match(/\\/(video|gif|post)\\/([A-Za-z0-9_-]+)/);
-                            if (m) { id = m[2]; break; }
-                        }
-                    }
-                    if (src && src.includes('.mp4')) {
-                        results.push({ src, poster, id: id || ('v_' + i) });
-                    }
-                });
-                return results;
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
             }
-        """)
-
-        await context.close()
-
-        community_label = slug.split("-")[0].capitalize()
-        result = []
-        seen = set()
-        for v in videos:
-            if v["src"] in seen:
-                continue
-            seen.add(v["src"])
-            result.append({
-                "id":        v["id"],
-                "mp4":       v["src"],
-                "thumb":     v["poster"],
-                "author":    community_label,
-                "community": community_label,
-            })
-
-        log.info("✓ %s → %d videos", slug, len(result))
-        return result
-
+        ) as client:
+            resp = await client.get(url)
+            
+            if resp.status_code != 200:
+                log.warning(f"Failed to fetch {url}: {resp.status_code}")
+                return []
+            
+            html = resp.text
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            videos = []
+            seen_urls = set()
+            
+            # Method 1: Look for video tags
+            video_elements = soup.find_all('video')
+            log.info(f"Found {len(video_elements)} video elements")
+            
+            for video in video_elements:
+                # Get video source
+                src = video.get('src', '')
+                
+                # Check for source tags
+                if not src:
+                    source = video.find('source')
+                    if source:
+                        src = source.get('src', '')
+                
+                # Check data attributes
+                if not src:
+                    for attr in video.attrs:
+                        if 'src' in attr.lower() or 'video' in attr.lower():
+                            src = video.get(attr, '')
+                            if src:
+                                break
+                
+                # Get poster
+                poster = video.get('poster', '')
+                
+                # Try to get video ID
+                video_id = f"vid_{len(videos)}"
+                parent = video.parent
+                for _ in range(6):
+                    if not parent:
+                        break
+                    links = parent.find_all('a', href=True)
+                    for link in links:
+                        href = link.get('href', '')
+                        match = re.search(r'/(video|post|gif|content)/([A-Za-z0-9_-]+)', href)
+                        if match:
+                            video_id = match.group(2)
+                            break
+                    if video_id != f"vid_{len(videos)}":
+                        break
+                    parent = parent.parent
+                
+                # Clean and validate URL
+                if src:
+                    if src.startswith('//'):
+                        src = 'https:' + src
+                    elif src.startswith('/'):
+                        src = base_url + src
+                    
+                    if '.mp4' in src or 'video' in src.lower():
+                        if src not in seen_urls:
+                            seen_urls.add(src)
+                            videos.append({
+                                'id': video_id,
+                                'mp4': src,
+                                'thumb': poster if poster else '',
+                                'author': slug.split('-')[0].capitalize(),
+                                'community': slug.split('-')[0].capitalize()
+                            })
+            
+            # Method 2: If no videos found, search for MP4 URLs in HTML
+            if not videos:
+                log.info("No video tags found, searching HTML for MP4 URLs...")
+                
+                # Find MP4 URLs
+                mp4_pattern = r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*'
+                mp4_urls = re.findall(mp4_pattern, html)
+                
+                for idx, url in enumerate(mp4_urls):
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        videos.append({
+                            'id': f"mp4_{idx}",
+                            'mp4': url,
+                            'thumb': '',
+                            'author': slug.split('-')[0].capitalize(),
+                            'community': slug.split('-')[0].capitalize()
+                        })
+            
+            # Method 3: Look for video URLs in script tags
+            if not videos:
+                log.info("No MP4 URLs found, searching scripts...")
+                script_pattern = r'(?:video|src|url)\s*[:=]\s*["\']([^"\']+\.mp4[^"\']*)["\']'
+                script_urls = re.findall(script_pattern, html, re.IGNORECASE)
+                
+                for idx, url in enumerate(script_urls):
+                    if url not in seen_urls:
+                        if not url.startswith('http'):
+                            url = base_url + url
+                        seen_urls.add(url)
+                        videos.append({
+                            'id': f"script_{idx}",
+                            'mp4': url,
+                            'thumb': '',
+                            'author': slug.split('-')[0].capitalize(),
+                            'community': slug.split('-')[0].capitalize()
+                        })
+            
+            log.info(f"✓ {slug} → {len(videos)} videos found")
+            return videos[:30]  # Limit to 30 videos per community
+            
     except Exception as e:
-        log.exception("✗ scrape_community(%s) failed: %s", slug, e)
+        log.exception(f"✗ Failed to scrape {slug}: {e}")
         return []
-
 
 def _to_short_video(v: dict) -> dict:
     return {
-        "id":          v["id"],
-        "title":       "",
-        "author":      v.get("author", ""),
-        "community":   v.get("community", ""),
-        "hlsUrl":      v["mp4"],
-        "audioUrl":    None,
+        "id": v["id"],
+        "title": "",
+        "author": v.get("author", ""),
+        "community": v.get("community", ""),
+        "hlsUrl": None,
+        "audioUrl": None,
         "fallbackUrl": v["mp4"],
-        "thumbnail":   v.get("thumb", ""),
-        "ups":         0,
-        "duration":    0,
-        "hasAudio":    True,
-        "width":       0,
-        "height":      0,
+        "thumbnail": v.get("thumb", ""),
+        "ups": 0,
+        "duration": 0,
+        "hasAudio": True,
+        "width": 0,
+        "height": 0,
     }
-
 
 @app.get("/shorts/feed")
 async def shorts_feed(
@@ -391,23 +399,27 @@ async def shorts_feed(
     if not slugs:
         raise HTTPException(status_code=400, detail="subs param is required")
 
-    # Max 5 slugs, scraped concurrently
+    # Limit to 5 slugs
     slugs = slugs[:5]
-    tasks = [scrape_community(base_url, slug) for slug in slugs]
+    
+    # Scrape each community
+    tasks = [scrape_community_http(base_url, slug) for slug in slugs]
     results = await asyncio.gather(*tasks)
 
-    merged, seen_ids = [], set()
+    # Merge and deduplicate
+    merged, seen_ids, seen_urls = [], set(), set()
     for group in results:
         for v in group:
-            if v["id"] not in seen_ids:
+            if v["id"] not in seen_ids and v["mp4"] not in seen_urls:
                 seen_ids.add(v["id"])
+                seen_urls.add(v["mp4"])
                 merged.append(v)
 
+    # Shuffle
     random.shuffle(merged)
-    log.info("shorts/feed → %d total videos", len(merged))
+    log.info(f"shorts/feed → {len(merged)} total videos")
 
     return {"videos": [_to_short_video(v) for v in merged], "count": len(merged)}
-
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
