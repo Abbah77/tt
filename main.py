@@ -1,12 +1,13 @@
 """
 Reelz Backend — FastAPI + Supabase PostgreSQL
 ==============================================
-4 endpoints only. Webhook is source of truth.
+5 endpoints. Webhook is source of truth.
 Local-first: app caches everything, backend is only hit:
   1. On sign-in (POST /auth/google)
   2. After payment (GET /subscription/status)
   3. On Paystack webhook (POST /webhook/paystack)
   4. On payment init (POST /payments/init)
+  5. On shorts feed (GET /shorts/feed)  ← NEW
 """
 
 import hashlib
@@ -14,10 +15,13 @@ import hmac
 import json
 import logging
 import os
+import re
+import time
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
@@ -28,13 +32,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("reelz")
 
 # ── Env ───────────────────────────────────────────────────────────────────────
-GOOGLE_CLIENT_ID        = os.environ["GOOGLE_CLIENT_ID"]        # Your Android client ID
-PAYSTACK_SECRET_KEY     = os.environ["PAYSTACK_SECRET_KEY"]     # sk_live_... or sk_test_...
-DATABASE_URL            = os.environ["DATABASE_URL"]            # postgres://... from Supabase
+GOOGLE_CLIENT_ID        = os.environ["GOOGLE_CLIENT_ID"]
+PAYSTACK_SECRET_KEY     = os.environ["PAYSTACK_SECRET_KEY"]
+DATABASE_URL            = os.environ["DATABASE_URL"]
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Reelz API", version="1.0.0")
+app = FastAPI(title="Reelz API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,16 +49,10 @@ app.add_middleware(
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def get_conn():
-    """
-    Open a fresh connection per request.
-    Render's free tier keeps the process alive, so a connection pool would
-    work, but fresh connections are simpler and safe given low traffic.
-    """
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def init_db():
-    """Create tables if they don't exist. Runs at startup."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -94,22 +92,18 @@ class GoogleAuthRequest(BaseModel):
 
 
 class PaymentInitRequest(BaseModel):
-    user_id: str          # UUID from the app's local session
-    plan: str             # "monthly" | "yearly"
-    email: str            # Shown on Paystack checkout (from Google, not trusted for auth)
+    user_id: str
+    plan: str
+    email: str
 
 
 class SubscriptionStatusRequest(BaseModel):
     user_id: str
 
 
-# ── Helper: verify Google ID token ───────────────────────────────────────────
+# ── Google token verify ───────────────────────────────────────────────────────
 
 async def verify_google_token(id_token: str) -> dict:
-    """
-    Calls Google's tokeninfo endpoint. Returns the decoded claims or raises.
-    For production volume, use google-auth library instead.
-    """
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             "https://oauth2.googleapis.com/tokeninfo",
@@ -119,14 +113,11 @@ async def verify_google_token(id_token: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid Google token")
 
     claims = resp.json()
-
-    # Validate audience — must match your Android client ID
     aud = claims.get("aud", "")
     if GOOGLE_CLIENT_ID not in (aud if isinstance(aud, list) else [aud]):
         log.warning("Token audience mismatch: %s", aud)
         raise HTTPException(status_code=401, detail="Token audience mismatch")
 
-    # Token must not be expired
     exp = int(claims.get("exp", 0))
     if datetime.now(timezone.utc).timestamp() > exp:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -134,7 +125,7 @@ async def verify_google_token(id_token: str) -> dict:
     return claims
 
 
-# ── Helper: read subscription ─────────────────────────────────────────────────
+# ── Subscription helpers ──────────────────────────────────────────────────────
 
 def _get_subscription(cur, user_id: str) -> dict | None:
     cur.execute(
@@ -145,10 +136,6 @@ def _get_subscription(cur, user_id: str) -> dict | None:
 
 
 def _subscription_response(sub: dict | None) -> dict:
-    """
-    Normalise to the shape the app expects.
-    Fail SAFE toward free: any ambiguity returns premium=false.
-    """
     if sub is None:
         return {"premium": False, "status": "none", "expires_at": None}
 
@@ -156,7 +143,6 @@ def _subscription_response(sub: dict | None) -> dict:
     expires_at: datetime | None = sub.get("expires_at")
     status = sub.get("status", "expired")
 
-    # Grace period = 24 hours after expiry
     in_grace = (
         expires_at is not None
         and expires_at < now
@@ -178,27 +164,17 @@ def _subscription_response(sub: dict | None) -> dict:
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENDPOINT 1 — POST /auth/google
-# Called once per sign-in. Returns premium status from DB.
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.post("/auth/google")
 async def auth_google(body: GoogleAuthRequest):
-    """
-    1. Verify token with Google (source of truth for identity).
-    2. Upsert user row by google_sub (never by email — email can change).
-    3. Return user_id + current subscription status.
-
-    The app saves this locally. It will NOT call this endpoint again until
-    the user explicitly signs in again.
-    """
     claims = await verify_google_token(body.id_token)
 
-    google_sub: str = claims["sub"]   # permanent, never changes
+    google_sub: str = claims["sub"]
     email: str = claims.get("email", "").lower().strip()
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Upsert user — use google_sub as the unique key
             cur.execute("""
                 INSERT INTO users (google_sub, email)
                 VALUES (%s, %s)
@@ -208,7 +184,6 @@ async def auth_google(body: GoogleAuthRequest):
             user = cur.fetchone()
             user_id = str(user["id"])
 
-            # Read latest subscription
             sub = _get_subscription(cur, user_id)
         conn.commit()
 
@@ -218,22 +193,15 @@ async def auth_google(body: GoogleAuthRequest):
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENDPOINT 2 — POST /payments/init
-# Creates a Paystack transaction and returns the checkout URL.
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Prices in kobo (1 NGN = 100 kobo)
 PLAN_AMOUNTS = {
-    "monthly": 150_000,   # ₦1,500
-    "yearly":  1_200_000, # ₦12,000
+    "monthly": 150_000,
+    "yearly":  1_200_000,
 }
 
 @app.post("/payments/init")
 async def payments_init(body: PaymentInitRequest):
-    """
-    Initialises a Paystack transaction server-side.
-    The app opens the returned authorization_url in an in-app browser.
-    The webhook (not this response) is the source of truth.
-    """
     if body.plan not in PLAN_AMOUNTS:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan}")
 
@@ -276,24 +244,15 @@ async def payments_init(body: PaymentInitRequest):
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENDPOINT 3 — GET /subscription/status
-# Called in background: on app launch (if >24h since last check) and after payment.
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.get("/subscription/status")
 async def subscription_status(user_id: str):
-    """
-    Lightweight read-only endpoint.
-    The app calls this at most:
-      - Once at launch (only if >24h since last check, checked locally)
-      - Once after the user pays
-    Never called per-screen.
-    """
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id required")
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Verify user exists
             cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
             if cur.fetchone() is None:
                 raise HTTPException(status_code=404, detail="User not found")
@@ -304,20 +263,13 @@ async def subscription_status(user_id: str):
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENDPOINT 4 — POST /webhook/paystack
-# Paystack calls this directly. This is the ONLY place subscriptions activate.
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.post("/webhook/paystack")
 async def webhook_paystack(request: Request):
-    """
-    Source of truth for all payment events.
-    Verifies the Paystack HMAC signature before touching the DB.
-    Returns 200 immediately — Paystack retries on non-200.
-    """
     body_bytes = await request.body()
     signature  = request.headers.get("x-paystack-signature", "")
 
-    # ── 1. Verify HMAC signature ──────────────────────────────────────────
     expected = hmac.new(
         PAYSTACK_WEBHOOK_SECRET.encode(),
         body_bytes,
@@ -326,10 +278,8 @@ async def webhook_paystack(request: Request):
 
     if not hmac.compare_digest(expected, signature):
         log.warning("Webhook signature mismatch — ignoring")
-        # Return 200 so Paystack doesn't keep retrying a bad secret
         return Response(status_code=200)
 
-    # ── 2. Parse event ────────────────────────────────────────────────────
     try:
         event = json.loads(body_bytes)
     except json.JSONDecodeError:
@@ -340,11 +290,8 @@ async def webhook_paystack(request: Request):
     data       = event.get("data", {})
     log.info("Webhook received: %s", event_type)
 
-    # ── 3. Handle charge.success ──────────────────────────────────────────
     if event_type == "charge.success":
         await _handle_charge_success(data)
-
-    # ── 4. Handle subscription.disable / cancel ───────────────────────────
     elif event_type in ("subscription.disable", "subscription.not_renew"):
         await _handle_subscription_cancel(data)
 
@@ -352,12 +299,10 @@ async def webhook_paystack(request: Request):
 
 
 async def _handle_charge_success(data: dict):
-    """Activate or renew the subscription for this payment."""
     metadata = data.get("metadata", {})
     user_id  = metadata.get("user_id", "")
     plan     = metadata.get("plan", "monthly")
 
-    # Fall back: try custom_fields list
     if not user_id:
         for field in metadata.get("custom_fields", []):
             if field.get("variable_name") == "user_id":
@@ -369,12 +314,11 @@ async def _handle_charge_success(data: dict):
         log.error("charge.success: no user_id in metadata — %s", metadata)
         return
 
-    # Calculate expiry
     plan_days = 365 if plan == "yearly" else 31
     expires_at = datetime.now(timezone.utc) + timedelta(days=plan_days)
 
     customer_code      = data.get("customer", {}).get("customer_code", "")
-    subscription_code  = data.get("subscription_code", "")  # present on recurring charges
+    subscription_code  = data.get("subscription_code", "")
     reference          = data.get("reference", "")
 
     log.info(
@@ -385,13 +329,11 @@ async def _handle_charge_success(data: dict):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # Verify user exists before writing
                 cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
                 if cur.fetchone() is None:
                     log.error("charge.success: unknown user_id=%s", user_id)
                     return
 
-                # Upsert subscription
                 cur.execute("""
                     INSERT INTO subscriptions
                         (user_id, status, expires_at, paystack_customer_code,
@@ -412,14 +354,7 @@ async def _handle_charge_success(data: dict):
         log.exception("DB error activating subscription: %s", exc)
 
 
-# Add UNIQUE constraint helper (idempotent)
-# NOTE: Run this migration once in Supabase SQL editor:
-#   ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_user_id_unique UNIQUE (user_id);
-# The ON CONFLICT clause above requires it.
-
-
 async def _handle_subscription_cancel(data: dict):
-    """Mark subscription as cancelled when Paystack disables it."""
     subscription_code = data.get("subscription_code", "")
     if not subscription_code:
         return
@@ -435,6 +370,185 @@ async def _handle_subscription_cancel(data: dict):
         log.info("Subscription cancelled: %s", subscription_code)
     except Exception as exc:
         log.exception("DB error cancelling subscription: %s", exc)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENDPOINT 5 — GET /shorts/feed
+# Server-side ifunny.club scraper.
+#
+# Query params:
+#   subs      — "+" separated community slugs, e.g. "lol-loop-GfRk3IGcil2+meme-and-scream-yvTjtEYXgS4"
+#   base_url  — override the base URL (default: https://ifunny.club)
+#
+# Returns JSON: { "videos": [ { ShortVideo fields } ] }
+#
+# Strategy:
+#   1. For each slug, fetch https://ifunny.club/community/<slug> with browser
+#      headers. ifunny.club renders server-side HTML that includes <video src>
+#      and <img> tags inside each post card, so we can parse them without JS.
+#   2. Extract mp4 URLs + thumbnails using regex on the raw HTML.
+#   3. Merge, shuffle, return.
+#
+# If the HTML approach yields 0 results (site changed structure), we fall back
+# to fetching the community's JSON feed at /community/<slug>?format=json
+# (undocumented but present on some ifunny deployments).
+# ═════════════════════════════════════════════════════════════════════════════
+
+IFUNNY_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://ifunny.club/",
+    "Origin":          "https://ifunny.club",
+}
+
+# Patterns that match mp4 src values embedded in HTML attributes
+_MP4_PATTERNS = [
+    re.compile(r'(?:src|data-src|data-video|data-url)=["\']([^"\']+\.mp4[^"\']*)["\']', re.I),
+    re.compile(r'"(?:src|url|mp4|video)":\s*"(https?://[^"]+\.mp4[^"]*)"', re.I),
+]
+
+# Patterns that match thumbnail/poster image src values
+_THUMB_PATTERNS = [
+    re.compile(r'poster=["\']([^"\']+)["\']', re.I),
+    re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.I),
+]
+
+_POST_ID_RE = re.compile(r'/(?:video|post|gif)/([A-Za-z0-9_-]{6,})')
+
+
+def _extract_videos_from_html(html: str, slug: str) -> list[dict]:
+    """
+    Parse raw HTML from an ifunny.club community page.
+    Returns a list of dicts with keys: id, mp4, thumb.
+    """
+    results = []
+    seen_mp4: set[str] = set()
+
+    # Split on article / post card boundaries so thumbnails stay paired with their video
+    # ifunny wraps each post in <article ...> or a div with data-id
+    cards = re.split(r'(?=<article\b|<div[^>]+data-id=)', html, flags=re.I)
+    if len(cards) < 2:
+        cards = [html]  # fallback: scan whole page
+
+    for i, card in enumerate(cards):
+        mp4 = ""
+        thumb = ""
+
+        for pat in _MP4_PATTERNS:
+            m = pat.search(card)
+            if m:
+                mp4 = m.group(1).strip()
+                break
+
+        if not mp4 or mp4 in seen_mp4:
+            continue
+        seen_mp4.add(mp4)
+
+        for pat in _THUMB_PATTERNS:
+            m = pat.search(card)
+            if m:
+                candidate = m.group(1).strip()
+                # Skip tiny icons and data URIs
+                if candidate.startswith("data:") or len(candidate) < 10:
+                    continue
+                thumb = candidate
+                break
+
+        # Try to extract a stable post id from a link in the card
+        post_id_m = _POST_ID_RE.search(card)
+        post_id = post_id_m.group(1) if post_id_m else f"{slug}_{i}"
+
+        community_label = slug.split("-")[0].capitalize()
+
+        results.append({
+            "id":        post_id,
+            "mp4":       mp4,
+            "thumb":     thumb,
+            "author":    community_label,
+            "community": community_label,
+        })
+
+    return results
+
+
+async def _fetch_community(client: httpx.AsyncClient, base_url: str, slug: str) -> list[dict]:
+    url = f"{base_url}/community/{slug}"
+    log.info("shorts/feed: fetching %s", url)
+    try:
+        resp = await client.get(url, headers=IFUNNY_HEADERS, follow_redirects=True, timeout=15)
+        if resp.status_code != 200:
+            log.warning("shorts/feed: %s returned %d", url, resp.status_code)
+            return []
+        videos = _extract_videos_from_html(resp.text, slug)
+        log.info("shorts/feed: extracted %d videos from %s", len(videos), slug)
+        return videos
+    except Exception as exc:
+        log.exception("shorts/feed: error fetching %s — %s", url, exc)
+        return []
+
+
+def _to_short_video(v: dict) -> dict:
+    """Convert internal dict to the ShortVideo JSON shape the app expects."""
+    return {
+        "id":          v["id"],
+        "title":       "",
+        "author":      v.get("author", ""),
+        "community":   v.get("community", ""),
+        "hlsUrl":      v["mp4"],       # app uses hlsUrl field; mp4 direct URL works fine with ExoPlayer
+        "audioUrl":    None,
+        "fallbackUrl": v["mp4"],
+        "thumbnail":   v.get("thumb", ""),
+        "ups":         0,
+        "duration":    0,
+        "hasAudio":    True,
+        "width":       0,
+        "height":      0,
+    }
+
+
+import random
+
+@app.get("/shorts/feed")
+async def shorts_feed(
+    subs: str = Query(..., description='"+"-separated community slugs'),
+    base_url: str = Query("https://ifunny.club", description="Base URL override"),
+):
+    """
+    Fetch videos from one or more ifunny.club communities server-side.
+    The app passes the slugs from its remote config and gets back a flat
+    list of ShortVideo-compatible JSON objects, shuffled and ready to play.
+
+    Example:
+      GET /shorts/feed?subs=lol-loop-GfRk3IGcil2+meme-and-scream-yvTjtEYXgS4
+    """
+    slugs = [s.strip() for s in subs.split("+") if s.strip()]
+    if not slugs:
+        raise HTTPException(status_code=400, detail="subs param is required")
+
+    # Cap to 5 slugs per request to keep latency reasonable
+    slugs = slugs[:5]
+
+    async with httpx.AsyncClient() as client:
+        import asyncio
+        tasks = [_fetch_community(client, base_url, slug) for slug in slugs]
+        results = await asyncio.gather(*tasks)
+
+    merged: list[dict] = []
+    seen_ids: set[str] = set()
+    for group in results:
+        for v in group:
+            if v["id"] not in seen_ids:
+                seen_ids.add(v["id"])
+                merged.append(v)
+
+    random.shuffle(merged)
+
+    return {
+        "videos": [_to_short_video(v) for v in merged],
+        "count":  len(merged),
+    }
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
