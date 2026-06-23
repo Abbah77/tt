@@ -1,7 +1,8 @@
-fastapi
-uvicorn[standard]
-psycopg2-binary
-httpx
-playwright
-python-dotenv
-pydantic
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+psycopg2-binary==2.9.9
+httpx==0.26.1
+beautifulsoup4==4.12.3
+lxml==5.1.0
+python-dotenv==1.0.1
+pydantic==2.6.0
