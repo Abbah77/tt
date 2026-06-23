@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
-httpx
 psycopg2-binary
-pydantic
+httpx
+playwright
 python-dotenv
+pydantic
