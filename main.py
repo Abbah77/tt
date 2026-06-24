@@ -1,6 +1,5 @@
 """
 Reelz Backend — FastAPI + Supabase PostgreSQL
-Optimized: direct ifunny.club JSON API with cursor pagination, no scraping/DOM parsing
 """
 
 import hashlib
@@ -13,9 +12,10 @@ import random
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse, urlencode
+from urllib.parse import urljoin, urlparse
 
 import httpx
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -30,13 +30,12 @@ PAYSTACK_SECRET_KEY     = os.environ["PAYSTACK_SECRET_KEY"]
 DATABASE_URL            = os.environ["DATABASE_URL"]
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
-# Cache TTL — stale-while-revalidate keeps every request instant after first load
-FEED_CACHE_TTL_SECONDS = 8 * 60  # 8 minutes
+# How long a cached feed slug is considered "fresh" before we trigger a
+# background refresh. Stale entries are still served instantly — the user
+# never pays the scrape latency after the very first load for a slug.
+FEED_CACHE_TTL_SECONDS = 10 * 60  # 10 minutes
 
-# How many videos to fetch per API page from ifunny.club
-PAGE_SIZE = 30
-
-app = FastAPI(title="Reelz API", version="2.0.0")
+app = FastAPI(title="Reelz API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,7 +73,6 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS feed_cache (
                     slug       TEXT PRIMARY KEY,
                     videos     JSONB NOT NULL,
-                    cursor     TEXT,
                     cached_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
             """)
@@ -247,225 +245,434 @@ async def _handle_subscription_cancel(data: dict):
     except Exception as exc:
         log.exception("DB error cancelling subscription: %s", exc)
 
-# ── ENDPOINT 5: GET /shorts/feed — Direct JSON API + Postgres cache ──────────
-#
-# ifunny.club exposes a clean JSON API at:
-#   GET /api/v1/feeds/community/{slug}?limit=30&next={cursor}
-#
-# Each response contains:
-#   { "items": [...posts], "paging": { "cursors": { "next": "..." } } }
-#
-# Each post has: postId, media.video[0].url, cover.url, stat, user, group, content
-# This is orders of magnitude faster than HTML scraping — pure JSON, no parsing.
-#
-# Stale-while-revalidate: first request pays the API cost once, every
-# subsequent request within TTL is instant from Postgres cache.
+# ── ENDPOINT 5: GET /shorts/feed — HTTP Scraper + Postgres cache ────────────
 
-_IFUNNY_HEADERS = {
-    "User-Agent": "iFunny/8.16.4 (Android; en_US; Pixel 7; Build/TQ3A.230805.001)",
-    "Accept": "application/json",
-    "Accept-Language": "en-US",
-    "X-App-Version": "8.16.4",
-    "X-Platform": "android",
-}
+def clean_url(url: str, base_url: str) -> str:
+    """Clean and normalize URLs."""
+    if not url:
+        return ''
 
-async def fetch_community_api(base_url: str, slug: str, cursor: Optional[str] = None) -> tuple[list[dict], Optional[str]]:
+    # .strip() only removes LEADING/TRAILING whitespace — it does nothing
+    # about whitespace embedded in the middle of the path (e.g. a stray
+    # space or HTML entity like &nbsp;/\xa0 picked up from the source page,
+    # which silently breaks the object key on CDNs like Aliyun OSS and
+    # produces a 404 even though the URL "looks" fine when printed).
+    # Strip ALL whitespace characters (regular space, tab, non-breaking
+    # space, etc.) anywhere in the string before doing anything else.
+    url = re.sub(r'\s+', '', url)
+
+    if not url:
+        return ''
+
+    # Handle relative URLs
+    if url.startswith('//'):
+        return 'https:' + url
+    elif url.startswith('/'):
+        return urljoin(base_url, url)
+    elif not url.startswith('http'):
+        return urljoin(base_url, url)
+
+    return url
+
+# ── NEW: extract posts from the embedded Next.js RSC JSON payload ───────────
+#
+# ifunny.club (MovieBox.Buzz) is a Next.js app that server-renders each page
+# with the full post data embedded as JSON inside `self.__next_f.push(...)`
+# script tags (React Server Components streaming format). Each post object
+# looks like:
+#   {"itemType":"POST","postId":"...","media":{"video":[{"url":"https://
+#    macdn.aoneroom.com/.../xyz.mp4","size":...,"duration":...}]},
+#    "stat":{"likeCount":...,"commentCount":...,"shareCount":...}, ...}
+#
+# This is far more reliable than scraping <video> tag attributes out of
+# rendered HTML:
+#   - The URL is a plain JSON string, never affected by HTML-entity or
+#     whitespace artifacts that previously caused broken/corrupted URLs.
+#   - Real engagement stats (likes/comments/shares) come for free, instead
+#     of the old placeholder math (ups/10) for comment count.
+#   - Real duration/width/height/fps/bitrate metadata is included.
+#
+# Falls back to the old HTML-scraping path if this extraction finds nothing,
+# in case ifunny.club changes their page structure.
+
+_PUSH_PATTERN = re.compile(r'self\.__next_f\.push\(\[1,\s*(".*?")\]\)', re.DOTALL)
+
+def _extract_balanced_json_array(text: str, start_idx: int) -> Optional[str]:
     """
-    Fetch one page from ifunny.club's JSON API.
-    Returns (videos, next_cursor).
+    Given the index of the opening '[' of a JSON array within `text`,
+    return the substring of the full, balanced array (respecting nested
+    brackets and quoted strings so commas/brackets inside string values
+    don't break the match).
     """
-    params: dict = {"limit": PAGE_SIZE}
-    if cursor:
-        params["next"] = cursor
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start_idx, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx:i + 1]
+    return None
 
-    url = f"{base_url.rstrip('/')}/api/v1/feeds/community/{slug}?{urlencode(params)}"
-    log.info(f"API fetch: {url}")
+def extract_posts_from_rsc_json(html: str) -> list[dict]:
+    """
+    Find and parse the `initialItems` (community/home feed) array embedded
+    in the page's Next.js RSC streaming payload. Returns a list of raw post
+    dicts in ifunny.club's own schema (NOT yet normalized to our ShortVideo
+    shape — see _post_json_to_video below for that).
+    """
+    posts: list[dict] = []
+    seen_post_ids: set[str] = set()
 
-    try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=_IFUNNY_HEADERS) as client:
-            resp = await client.get(url)
+    for match in _PUSH_PATTERN.finditer(html):
+        raw_literal = match.group(1)
+        try:
+            # raw_literal is itself a JSON string literal (quoted, with
+            # escaped inner quotes) — json.loads() on it gives us the
+            # properly unescaped inner string to search/parse further.
+            unescaped = json.loads(raw_literal)
+        except (json.JSONDecodeError, ValueError):
+            continue
 
-        if resp.status_code != 200:
-            log.warning(f"API returned {resp.status_code} for {slug}")
-            return [], None
+        search_from = 0
+        while True:
+            marker_idx = unescaped.find('"initialItems":[', search_from)
+            if marker_idx == -1:
+                break
+            array_start = marker_idx + len('"initialItems":')
+            array_text = _extract_balanced_json_array(unescaped, array_start)
+            search_from = array_start + 1
+            if not array_text:
+                continue
+            try:
+                items = json.loads(array_text)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for item in items:
+                pid = item.get("postId", "")
+                if pid and pid not in seen_post_ids:
+                    seen_post_ids.add(pid)
+                    posts.append(item)
 
-        data = resp.json()
+    return posts
 
-        # Handle both flat and nested response shapes
-        items = data.get("items") or data.get("data", {}).get("items") or []
-        paging = data.get("paging") or data.get("data", {}).get("paging") or {}
-        next_cursor = (paging.get("cursors") or {}).get("next") or paging.get("next")
-
-        videos = []
-        seen: set[str] = set()
-
-        for item in items:
-            # Items can be wrapped in a "post" key or be the post directly
-            post = item.get("post") or item if isinstance(item, dict) else {}
-            v = _post_to_video(post)
-            if v and v["mp4"] not in seen:
-                seen.add(v["mp4"])
-                videos.append(v)
-
-        log.info(f"✓ {slug} → {len(videos)} videos, next_cursor={'yes' if next_cursor else 'no'}")
-        return videos, next_cursor
-
-    except Exception as e:
-        log.exception(f"✗ API error for {slug}: {e}")
-        return [], None
-
-
-def _post_to_video(post: dict) -> Optional[dict]:
-    """Normalize one ifunny post into our internal video shape."""
-    if not post:
+def _post_json_to_video(post: dict) -> Optional[dict]:
+    """Normalize one ifunny.club post JSON object into our internal video dict."""
+    media = post.get("media") or {}
+    videos = media.get("video") or []
+    if not videos:
         return None
-
-    # Resolve video URL — check multiple known locations
-    media    = post.get("media") or {}
-    video_list = media.get("video") or []
-    if not video_list and isinstance(media, dict):
-        # Some responses put it at media.url directly for video posts
-        direct = media.get("url", "")
-        if direct and ".mp4" in direct:
-            video_list = [{"url": direct}]
-
-    if not video_list:
-        return None
-
-    video_url = (video_list[0] or {}).get("url", "").strip()
-    # Strip any whitespace/invisible chars embedded in the URL
-    video_url = re.sub(r'\s+', '', video_url)
+    video_url = (videos[0] or {}).get("url", "")
     if not video_url:
         return None
 
-    # Thumbnail — cover takes priority, then media.thumbnail
-    cover     = post.get("cover") or media.get("cover") or media.get("thumbnail") or {}
-    thumb_url = re.sub(r'\s+', '', (cover.get("url") or "").strip())
+    cover = post.get("cover") or media.get("cover") or {}
+    thumb_url = cover.get("url", "")
 
-    stat  = post.get("stat")  or {}
-    user  = post.get("user")  or {}
-    group = post.get("group") or post.get("community") or {}
-    vid0  = video_list[0] or {}
+    stat = post.get("stat") or {}
+    user = post.get("user") or {}
+    group = post.get("group") or {}
 
     return {
-        "id":        post.get("postId") or post.get("id") or "",
-        "mp4":       video_url,
-        "thumb":     thumb_url,
-        "title":     (post.get("content") or post.get("title") or "").strip(),
-        "author":    (user.get("nickname") or user.get("name") or "").strip(),
-        "community": (group.get("name") or group.get("title") or "").strip(),
-        "ups":       int(stat.get("likeCount") or stat.get("likes") or 0),
-        "comments":  int(stat.get("commentCount") or stat.get("comments") or 0),
-        "duration":  int(vid0.get("duration") or 0),
-        "width":     int(vid0.get("width")    or 0),
-        "height":    int(vid0.get("height")   or 0),
+        "id": post.get("postId", ""),
+        "mp4": video_url,
+        "thumb": thumb_url,
+        "title": post.get("content", "") or "",
+        "author": user.get("nickname", "") or "",
+        "community": group.get("name", "") or "",
+        "ups": int(stat.get("likeCount", 0) or 0),
+        "comments": int(stat.get("commentCount", 0) or 0),
+        "duration": int((videos[0] or {}).get("duration", 0) or 0),
+        "width": int((videos[0] or {}).get("width", 0) or 0),
+        "height": int((videos[0] or {}).get("height", 0) or 0),
     }
 
+async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
+    """
+    Scrape ifunny.club for videos using HTTP requests.
+    """
+    url = f"{base_url}/community/{slug}"
+    log.info(f"Scraping: {url}")
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Referer": base_url + "/",
+                "Origin": base_url,
+            }
+        ) as client:
+            resp = await client.get(url)
+
+            if resp.status_code != 200:
+                log.warning(f"Failed to fetch {url}: {resp.status_code}")
+                return []
+
+            html = resp.text
+
+            # ── Try the reliable JSON extraction first ────────────────────
+            rsc_posts = extract_posts_from_rsc_json(html)
+            if rsc_posts:
+                videos_from_json = []
+                seen_from_json = set()
+                for post in rsc_posts:
+                    v = _post_json_to_video(post)
+                    if v and v["mp4"] not in seen_from_json:
+                        seen_from_json.add(v["mp4"])
+                        videos_from_json.append(v)
+                if videos_from_json:
+                    log.info(f"✓ {slug} → {len(videos_from_json)} videos via RSC JSON extraction")
+                    return videos_from_json[:30]
+                log.info(f"RSC JSON found {len(rsc_posts)} posts but none had usable video URLs — falling back to HTML scraping")
+            else:
+                log.info("No RSC JSON initialItems found — falling back to HTML scraping")
+
+            # ── Fallback: old HTML <video> tag / regex scraping ───────────
+            soup = BeautifulSoup(html, 'html.parser')
+
+            videos = []
+            seen_urls = set()
+
+            # Find all video elements
+            video_elements = soup.find_all('video')
+            log.info(f"Found {len(video_elements)} video elements")
+
+            for video in video_elements:
+                # Get video source from various attributes
+                src = video.get('src', '')
+
+                # Check for source tags
+                if not src:
+                    source = video.find('source')
+                    if source:
+                        src = source.get('src', '')
+
+                # Check data attributes
+                if not src:
+                    for attr in ['data-src', 'data-video', 'data-url', 'data-href']:
+                        if video.get(attr):
+                            src = video.get(attr)
+                            break
+
+                # Get poster/thumbnail
+                poster = video.get('poster', '')
+                if not poster:
+                    for attr in ['data-poster', 'data-thumb', 'data-thumbnail']:
+                        if video.get(attr):
+                            poster = video.get(attr)
+                            break
+
+                # Try to get video ID from parent links
+                video_id = f"vid_{len(videos)}"
+                parent = video.parent
+                for _ in range(6):
+                    if not parent:
+                        break
+                    links = parent.find_all('a', href=True)
+                    for link in links:
+                        href = link.get('href', '')
+                        match = re.search(r'/(video|post|gif|content)/([A-Za-z0-9_-]+)', href)
+                        if match:
+                            video_id = match.group(2)
+                            break
+                    if video_id != f"vid_{len(videos)}":
+                        break
+                    parent = parent.parent
+
+                # Clean URL
+                if src:
+                    src = clean_url(src, base_url)
+
+                    if '.mp4' in src.lower() or '/video/' in src.lower():
+                        if src not in seen_urls:
+                            seen_urls.add(src)
+
+                            # Clean poster URL
+                            if poster:
+                                poster = clean_url(poster, base_url)
+
+                            # Try to find a title
+                            title = ''
+                            parent = video.parent
+                            for _ in range(4):
+                                if not parent:
+                                    break
+                                # Check for heading
+                                heading = parent.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+                                if heading:
+                                    title = heading.get_text(strip=True)
+                                    break
+                                # Check for title attributes
+                                title_attrs = parent.find_all(attrs={'title': True})
+                                if title_attrs:
+                                    title = title_attrs[0].get('title', '')
+                                    break
+                                parent = parent.parent
+
+                            videos.append({
+                                'id': video_id,
+                                'mp4': src,
+                                'thumb': poster if poster else '',
+                                'title': title if title else f"Video {len(videos) + 1}",
+                                'author': slug.split('-')[0].capitalize(),
+                                'community': slug.split('-')[0].capitalize()
+                            })
+
+            # If no videos found, search HTML for MP4 URLs
+            if not videos:
+                log.info("No video tags found, searching HTML for MP4 URLs...")
+
+                # Find all MP4 URLs in HTML
+                mp4_pattern = r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*'
+                mp4_urls = re.findall(mp4_pattern, html)
+
+                for idx, raw_mp4_url in enumerate(mp4_urls[:30]):
+                    mp4_url = re.sub(r'\s+', '', raw_mp4_url)
+                    if not mp4_url or mp4_url in seen_urls:
+                        continue
+                    seen_urls.add(mp4_url)
+
+                    # Try to find thumbnail nearby
+                    thumb = ''
+                    context = html[max(0, html.find(raw_mp4_url) - 500):html.find(raw_mp4_url) + 500]
+                    thumb_pattern = r'https?://[^\s"\'<>]+\.(?:jpg|png|jpeg|webp|gif)'
+                    thumbs = re.findall(thumb_pattern, context)
+                    if thumbs:
+                        thumb = re.sub(r'\s+', '', thumbs[0])
+
+                    videos.append({
+                        'id': f"mp4_{idx}",
+                        'mp4': mp4_url,
+                        'thumb': thumb,
+                        'title': f"Video {idx + 1}",
+                        'author': slug.split('-')[0].capitalize(),
+                        'community': slug.split('-')[0].capitalize()
+                    })
+
+            log.info(f"✓ {slug} → {len(videos)} videos found")
+            return videos[:30]
+
+    except Exception as e:
+        log.exception(f"✗ Failed to scrape {slug}: {e}")
+        return []
 
 def _to_short_video(v: dict) -> dict:
     return {
-        "id":          v.get("id", ""),
-        "title":       v.get("title", ""),
-        "author":      v.get("author", ""),
-        "community":   v.get("community", ""),
-        "hlsUrl":      "",
-        "audioUrl":    None,
+        "id": v.get("id", ""),
+        "title": v.get("title", ""),
+        "author": v.get("author", ""),
+        "community": v.get("community", ""),
+        "hlsUrl": "",
+        "audioUrl": None,
         "fallbackUrl": v.get("mp4", ""),
-        "thumbnail":   v.get("thumb", ""),
-        "ups":         v.get("ups", 0),
-        "comments":    v.get("comments", 0),
-        "duration":    v.get("duration", 0),
-        "hasAudio":    True,
-        "width":       v.get("width", 0),
-        "height":      v.get("height", 0),
+        "thumbnail": v.get("thumb", ""),
+        "ups": v.get("ups", 0),
+        "duration": v.get("duration", 0),
+        "hasAudio": True,
+        "width": v.get("width", 0),
+        "height": v.get("height", 0),
     }
 
+# ── Feed cache (Postgres-backed, stale-while-revalidate) ──────────────────────
+#
+# Read path:
+#   1. Cache row missing entirely      -> scrape synchronously, write cache, return fresh
+#   2. Cache row present and fresh     -> return cached immediately
+#   3. Cache row present but stale     -> return cached immediately AND
+#                                          kick off a background refresh for next time
+#
+# This means a real scrape only ever blocks a user request the very first
+# time a slug is ever requested. Every request after that is instant.
 
-# ── Feed cache (Postgres, stale-while-revalidate) ─────────────────────────────
-
+# Tracks slugs currently being refreshed in the background so we don't
+# fire duplicate scrapes if multiple requests land while one is in flight.
 _refresh_in_progress: set[str] = set()
 
 def _read_cache(cur, slug: str) -> Optional[dict]:
-    cur.execute("SELECT videos, cursor, cached_at FROM feed_cache WHERE slug = %s", (slug,))
+    cur.execute("SELECT videos, cached_at FROM feed_cache WHERE slug = %s", (slug,))
     return cur.fetchone()
 
-def _write_cache(slug: str, videos: list[dict], cursor: Optional[str] = None):
+def _write_cache(slug: str, videos: list[dict]):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO feed_cache (slug, videos, cursor, cached_at)
-                    VALUES (%s, %s, %s, now())
+                    INSERT INTO feed_cache (slug, videos, cached_at)
+                    VALUES (%s, %s, now())
                     ON CONFLICT (slug) DO UPDATE SET
-                        videos    = EXCLUDED.videos,
-                        cursor    = EXCLUDED.cursor,
-                        cached_at = EXCLUDED.cached_at
-                """, (slug, json.dumps(videos), cursor))
+                        videos = EXCLUDED.videos, cached_at = EXCLUDED.cached_at
+                """, (slug, json.dumps(videos)))
             conn.commit()
     except Exception:
         log.exception(f"Failed writing feed cache for slug={slug}")
 
-async def _fetch_and_cache(base_url: str, slug: str, cursor: Optional[str] = None) -> list[dict]:
-    videos, next_cursor = await fetch_community_api(base_url, slug, cursor)
-    if videos:
-        _write_cache(slug, videos, next_cursor)
+async def _scrape_and_cache(base_url: str, slug: str) -> list[dict]:
+    videos = await scrape_community_http(base_url, slug)
+    # Shuffle once at write-time so repeated reads within the TTL window
+    # stay in a stable order (no re-shuffling on every loadMore/refresh).
+    random.shuffle(videos)
+    _write_cache(slug, videos)
     return videos
 
-def _schedule_background_refresh(base_url: str, slug: str, cursor: Optional[str]):
+def _schedule_background_refresh(base_url: str, slug: str):
     if slug in _refresh_in_progress:
         return
     _refresh_in_progress.add(slug)
 
     async def _run():
         try:
-            await _fetch_and_cache(base_url, slug, cursor)
+            await _scrape_and_cache(base_url, slug)
             log.info(f"↻ background refresh complete for slug={slug}")
         finally:
             _refresh_in_progress.discard(slug)
 
     asyncio.create_task(_run())
 
-async def get_videos_for_slug(base_url: str, slug: str, page_cursor: Optional[str] = None) -> tuple[list[dict], Optional[str]]:
-    """
-    Returns (videos, next_cursor).
-    - If page_cursor is given (pagination request): always fetches live from API.
-    - Otherwise: stale-while-revalidate from cache.
-    """
-    if page_cursor:
-        # Explicit pagination — fetch fresh page, don't touch cache
-        return await fetch_community_api(base_url, slug, page_cursor)
-
+async def get_videos_for_slug(base_url: str, slug: str) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             row = _read_cache(cur, slug)
 
     if row is None:
-        log.info(f"cache MISS slug={slug} — fetching from API")
-        videos, next_cursor = await fetch_community_api(base_url, slug)
-        if videos:
-            _write_cache(slug, videos, next_cursor)
-        return videos, next_cursor
+        # Never cached before — this request pays the scrape cost once.
+        log.info(f"cache MISS slug={slug} — scraping synchronously")
+        return await _scrape_and_cache(base_url, slug)
 
     age = (datetime.now(timezone.utc) - row["cached_at"]).total_seconds()
-    videos     = row["videos"]
-    cached_cur = row.get("cursor")
+    videos = row["videos"]
 
     if age > FEED_CACHE_TTL_SECONDS:
-        log.info(f"cache STALE slug={slug} age={int(age)}s — serving stale, refreshing in bg")
-        _schedule_background_refresh(base_url, slug, None)
+        log.info(f"cache STALE slug={slug} age={int(age)}s — serving stale + refreshing in background")
+        _schedule_background_refresh(base_url, slug)
     else:
         log.info(f"cache HIT slug={slug} age={int(age)}s")
 
-    return videos, cached_cur
-
-
-# ── GET /shorts/feed ──────────────────────────────────────────────────────────
+    return videos
 
 @app.get("/shorts/feed")
 async def shorts_feed(
     subs: str = Query(..., description='"+"-separated community slugs'),
     base_url: str = Query("https://ifunny.club"),
-    cursor: Optional[str] = Query(None, description="Pagination cursor for next page"),
 ):
     slugs = [s.strip() for s in subs.replace("%2B", "+").split("+") if s.strip()]
     if not slugs:
@@ -473,39 +680,27 @@ async def shorts_feed(
 
     slugs = slugs[:5]
 
-    # Fetch all slugs in parallel
-    tasks = [get_videos_for_slug(base_url, slug, cursor) for slug in slugs]
+    tasks = [get_videos_for_slug(base_url, slug) for slug in slugs]
     results = await asyncio.gather(*tasks)
 
-    merged: list[dict] = []
-    seen_urls: set[str] = set()
-    next_cursors: list[str] = []
-
-    for videos, next_cur in results:
-        for v in videos:
+    merged, seen_urls = [], set()
+    for group in results:
+        for v in group:
             if v["mp4"] not in seen_urls:
                 seen_urls.add(v["mp4"])
                 merged.append(v)
-        if next_cur:
-            next_cursors.append(next_cur)
 
-    # Shuffle only on first load (no cursor) for feed variety
-    if not cursor:
-        random.shuffle(merged)
+    log.info(f"shorts/feed → {len(merged)} total videos")
 
-    log.info(f"shorts/feed → {len(merged)} videos cursor={'yes' if cursor else 'no'}")
-
-    return {
-        "videos":      [_to_short_video(v) for v in merged],
-        "count":       len(merged),
-        "next_cursor": next_cursors[0] if next_cursors else None,
-    }
-
-
-# ── POST /shorts/cache/clear ──────────────────────────────────────────────────
+    return {"videos": [_to_short_video(v) for v in merged], "count": len(merged)}
 
 @app.post("/shorts/cache/clear")
-async def clear_feed_cache(slug: Optional[str] = Query(None)):
+async def clear_feed_cache(slug: Optional[str] = Query(None, description="Clear one slug, or omit to clear all")):
+    """
+    Manually invalidate the feed cache. Useful right after a scraper fix so a
+    previously-cached batch of (possibly broken) URLs doesn't keep being
+    served for the rest of its TTL window.
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             if slug:
@@ -515,7 +710,6 @@ async def clear_feed_cache(slug: Optional[str] = Query(None)):
             cleared = cur.rowcount
         conn.commit()
     return {"cleared_rows": cleared}
-
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
@@ -527,14 +721,13 @@ async def health():
 async def root():
     return {
         "status": "ok",
-        "message": "Reelz API v2 — direct JSON feed",
+        "message": "Reelz API is running",
         "endpoints": {
-            "/auth/google":        "POST - Google authentication",
-            "/payments/init":      "POST - Initialize payment",
-            "/subscription/status":"GET  - Check subscription status",
-            "/webhook/paystack":   "POST - Paystack webhook",
-            "/shorts/feed":        "GET  - Video feed (cursor pagination)",
-            "/shorts/cache/clear": "POST - Invalidate feed cache",
-            "/health":             "GET  - Health check",
+            "/auth/google": "POST - Google authentication",
+            "/payments/init": "POST - Initialize payment",
+            "/subscription/status": "GET - Check subscription status",
+            "/webhook/paystack": "POST - Paystack webhook",
+            "/shorts/feed": "GET - Get video feed",
+            "/health": "GET - Health check"
         }
     }
