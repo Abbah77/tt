@@ -1,8 +1,6 @@
 fastapi
 uvicorn[standard]
-psycopg2-binary
 httpx
-beautifulsoup4
-lxml
-python-dotenv
+psycopg2-binary
 pydantic
+python-multipart
