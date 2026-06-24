@@ -426,7 +426,7 @@ def _to_short_video(v: dict) -> dict:
         "title": v.get("title", ""),
         "author": v.get("author", ""),
         "community": v.get("community", ""),
-        "hlsUrl": None,
+        "hlsUrl": "",
         "audioUrl": None,
         "fallbackUrl": v.get("mp4", ""),
         "thumbnail": v.get("thumb", ""),
