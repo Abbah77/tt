@@ -252,8 +252,17 @@ def clean_url(url: str, base_url: str) -> str:
     if not url:
         return ''
 
-    # Remove whitespace
-    url = url.strip()
+    # .strip() only removes LEADING/TRAILING whitespace — it does nothing
+    # about whitespace embedded in the middle of the path (e.g. a stray
+    # space or HTML entity like &nbsp;/\xa0 picked up from the source page,
+    # which silently breaks the object key on CDNs like Aliyun OSS and
+    # produces a 404 even though the URL "looks" fine when printed).
+    # Strip ALL whitespace characters (regular space, tab, non-breaking
+    # space, etc.) anywhere in the string before doing anything else.
+    url = re.sub(r'\s+', '', url)
+
+    if not url:
+        return ''
 
     # Handle relative URLs
     if url.startswith('//'):
@@ -392,26 +401,28 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                 mp4_pattern = r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*'
                 mp4_urls = re.findall(mp4_pattern, html)
 
-                for idx, mp4_url in enumerate(mp4_urls[:30]):
-                    if mp4_url not in seen_urls:
-                        seen_urls.add(mp4_url)
+                for idx, raw_mp4_url in enumerate(mp4_urls[:30]):
+                    mp4_url = re.sub(r'\s+', '', raw_mp4_url)
+                    if not mp4_url or mp4_url in seen_urls:
+                        continue
+                    seen_urls.add(mp4_url)
 
-                        # Try to find thumbnail nearby
-                        thumb = ''
-                        context = html[max(0, html.find(mp4_url) - 500):html.find(mp4_url) + 500]
-                        thumb_pattern = r'https?://[^\s"\'<>]+\.(?:jpg|png|jpeg|webp|gif)'
-                        thumbs = re.findall(thumb_pattern, context)
-                        if thumbs:
-                            thumb = thumbs[0]
+                    # Try to find thumbnail nearby
+                    thumb = ''
+                    context = html[max(0, html.find(raw_mp4_url) - 500):html.find(raw_mp4_url) + 500]
+                    thumb_pattern = r'https?://[^\s"\'<>]+\.(?:jpg|png|jpeg|webp|gif)'
+                    thumbs = re.findall(thumb_pattern, context)
+                    if thumbs:
+                        thumb = re.sub(r'\s+', '', thumbs[0])
 
-                        videos.append({
-                            'id': f"mp4_{idx}",
-                            'mp4': mp4_url,
-                            'thumb': thumb,
-                            'title': f"Video {idx + 1}",
-                            'author': slug.split('-')[0].capitalize(),
-                            'community': slug.split('-')[0].capitalize()
-                        })
+                    videos.append({
+                        'id': f"mp4_{idx}",
+                        'mp4': mp4_url,
+                        'thumb': thumb,
+                        'title': f"Video {idx + 1}",
+                        'author': slug.split('-')[0].capitalize(),
+                        'community': slug.split('-')[0].capitalize()
+                    })
 
             log.info(f"✓ {slug} → {len(videos)} videos found")
             return videos[:30]
@@ -537,6 +548,23 @@ async def shorts_feed(
     log.info(f"shorts/feed → {len(merged)} total videos")
 
     return {"videos": [_to_short_video(v) for v in merged], "count": len(merged)}
+
+@app.post("/shorts/cache/clear")
+async def clear_feed_cache(slug: Optional[str] = Query(None, description="Clear one slug, or omit to clear all")):
+    """
+    Manually invalidate the feed cache. Useful right after a scraper fix so a
+    previously-cached batch of (possibly broken) URLs doesn't keep being
+    served for the rest of its TTL window.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if slug:
+                cur.execute("DELETE FROM feed_cache WHERE slug = %s", (slug,))
+            else:
+                cur.execute("DELETE FROM feed_cache")
+            cleared = cur.rowcount
+        conn.commit()
+    return {"cleared_rows": cleared}
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
