@@ -274,6 +274,132 @@ def clean_url(url: str, base_url: str) -> str:
 
     return url
 
+# ── NEW: extract posts from the embedded Next.js RSC JSON payload ───────────
+#
+# ifunny.club (MovieBox.Buzz) is a Next.js app that server-renders each page
+# with the full post data embedded as JSON inside `self.__next_f.push(...)`
+# script tags (React Server Components streaming format). Each post object
+# looks like:
+#   {"itemType":"POST","postId":"...","media":{"video":[{"url":"https://
+#    macdn.aoneroom.com/.../xyz.mp4","size":...,"duration":...}]},
+#    "stat":{"likeCount":...,"commentCount":...,"shareCount":...}, ...}
+#
+# This is far more reliable than scraping <video> tag attributes out of
+# rendered HTML:
+#   - The URL is a plain JSON string, never affected by HTML-entity or
+#     whitespace artifacts that previously caused broken/corrupted URLs.
+#   - Real engagement stats (likes/comments/shares) come for free, instead
+#     of the old placeholder math (ups/10) for comment count.
+#   - Real duration/width/height/fps/bitrate metadata is included.
+#
+# Falls back to the old HTML-scraping path if this extraction finds nothing,
+# in case ifunny.club changes their page structure.
+
+_PUSH_PATTERN = re.compile(r'self\.__next_f\.push\(\[1,\s*(".*?")\]\)', re.DOTALL)
+
+def _extract_balanced_json_array(text: str, start_idx: int) -> Optional[str]:
+    """
+    Given the index of the opening '[' of a JSON array within `text`,
+    return the substring of the full, balanced array (respecting nested
+    brackets and quoted strings so commas/brackets inside string values
+    don't break the match).
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start_idx, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx:i + 1]
+    return None
+
+def extract_posts_from_rsc_json(html: str) -> list[dict]:
+    """
+    Find and parse the `initialItems` (community/home feed) array embedded
+    in the page's Next.js RSC streaming payload. Returns a list of raw post
+    dicts in ifunny.club's own schema (NOT yet normalized to our ShortVideo
+    shape — see _post_json_to_video below for that).
+    """
+    posts: list[dict] = []
+    seen_post_ids: set[str] = set()
+
+    for match in _PUSH_PATTERN.finditer(html):
+        raw_literal = match.group(1)
+        try:
+            # raw_literal is itself a JSON string literal (quoted, with
+            # escaped inner quotes) — json.loads() on it gives us the
+            # properly unescaped inner string to search/parse further.
+            unescaped = json.loads(raw_literal)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        search_from = 0
+        while True:
+            marker_idx = unescaped.find('"initialItems":[', search_from)
+            if marker_idx == -1:
+                break
+            array_start = marker_idx + len('"initialItems":')
+            array_text = _extract_balanced_json_array(unescaped, array_start)
+            search_from = array_start + 1
+            if not array_text:
+                continue
+            try:
+                items = json.loads(array_text)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            for item in items:
+                pid = item.get("postId", "")
+                if pid and pid not in seen_post_ids:
+                    seen_post_ids.add(pid)
+                    posts.append(item)
+
+    return posts
+
+def _post_json_to_video(post: dict) -> Optional[dict]:
+    """Normalize one ifunny.club post JSON object into our internal video dict."""
+    media = post.get("media") or {}
+    videos = media.get("video") or []
+    if not videos:
+        return None
+    video_url = (videos[0] or {}).get("url", "")
+    if not video_url:
+        return None
+
+    cover = post.get("cover") or media.get("cover") or {}
+    thumb_url = cover.get("url", "")
+
+    stat = post.get("stat") or {}
+    user = post.get("user") or {}
+    group = post.get("group") or {}
+
+    return {
+        "id": post.get("postId", ""),
+        "mp4": video_url,
+        "thumb": thumb_url,
+        "title": post.get("content", "") or "",
+        "author": user.get("nickname", "") or "",
+        "community": group.get("name", "") or "",
+        "ups": int(stat.get("likeCount", 0) or 0),
+        "comments": int(stat.get("commentCount", 0) or 0),
+        "duration": int((videos[0] or {}).get("duration", 0) or 0),
+        "width": int((videos[0] or {}).get("width", 0) or 0),
+        "height": int((videos[0] or {}).get("height", 0) or 0),
+    }
+
 async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
     """
     Scrape ifunny.club for videos using HTTP requests.
@@ -303,6 +429,25 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                 return []
 
             html = resp.text
+
+            # ── Try the reliable JSON extraction first ────────────────────
+            rsc_posts = extract_posts_from_rsc_json(html)
+            if rsc_posts:
+                videos_from_json = []
+                seen_from_json = set()
+                for post in rsc_posts:
+                    v = _post_json_to_video(post)
+                    if v and v["mp4"] not in seen_from_json:
+                        seen_from_json.add(v["mp4"])
+                        videos_from_json.append(v)
+                if videos_from_json:
+                    log.info(f"✓ {slug} → {len(videos_from_json)} videos via RSC JSON extraction")
+                    return videos_from_json[:30]
+                log.info(f"RSC JSON found {len(rsc_posts)} posts but none had usable video URLs — falling back to HTML scraping")
+            else:
+                log.info("No RSC JSON initialItems found — falling back to HTML scraping")
+
+            # ── Fallback: old HTML <video> tag / regex scraping ───────────
             soup = BeautifulSoup(html, 'html.parser')
 
             videos = []
@@ -441,11 +586,11 @@ def _to_short_video(v: dict) -> dict:
         "audioUrl": None,
         "fallbackUrl": v.get("mp4", ""),
         "thumbnail": v.get("thumb", ""),
-        "ups": 0,
-        "duration": 0,
+        "ups": v.get("ups", 0),
+        "duration": v.get("duration", 0),
         "hasAudio": True,
-        "width": 0,
-        "height": 0,
+        "width": v.get("width", 0),
+        "height": v.get("height", 0),
     }
 
 # ── Feed cache (Postgres-backed, stale-while-revalidate) ──────────────────────
