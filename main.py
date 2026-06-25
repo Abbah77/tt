@@ -30,12 +30,12 @@ PAYSTACK_SECRET_KEY     = os.environ["PAYSTACK_SECRET_KEY"]
 DATABASE_URL            = os.environ["DATABASE_URL"]
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET", PAYSTACK_SECRET_KEY)
 
-# How long a cached feed slug is considered "fresh" before we trigger a
+# How long a cached feed page is considered "fresh" before we trigger a
 # background refresh. Stale entries are still served instantly — the user
-# never pays the scrape latency after the very first load for a slug.
+# never pays the network latency after the very first load for a page.
 FEED_CACHE_TTL_SECONDS = 10 * 60  # 10 minutes
 
-app = FastAPI(title="Reelz API", version="1.3.0")
+app = FastAPI(title="Reelz API", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -70,11 +70,42 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
                 CREATE INDEX IF NOT EXISTS idx_users_google_sub      ON users(google_sub);
 
+                -- Cache key is now "slug:page" so paginated requests don't
+                -- collide on a single cached blob per slug — each page of
+                -- the feed (explore or community) is cached independently,
+                -- which is what makes infinite scroll actually infinite
+                -- instead of capped at whatever the first scrape returned.
                 CREATE TABLE IF NOT EXISTS feed_cache (
-                    slug       TEXT PRIMARY KEY,
+                    cache_key  TEXT PRIMARY KEY,
                     videos     JSONB NOT NULL,
+                    has_more   BOOLEAN NOT NULL DEFAULT true,
                     cached_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 );
+            """)
+            # Migration path: earlier deployments created feed_cache with a
+            # "slug" primary key and no "has_more" column. Add what's
+            # missing rather than dropping/recreating, so existing cached
+            # rows survive the upgrade instead of forcing a cold cache.
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'feed_cache' AND column_name = 'cache_key'
+                    ) AND EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'feed_cache' AND column_name = 'slug'
+                    ) THEN
+                        ALTER TABLE feed_cache RENAME COLUMN slug TO cache_key;
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'feed_cache' AND column_name = 'has_more'
+                    ) THEN
+                        ALTER TABLE feed_cache ADD COLUMN has_more BOOLEAN NOT NULL DEFAULT true;
+                    END IF;
+                END $$;
             """)
         conn.commit()
     log.info("DB tables ensured")
@@ -245,7 +276,141 @@ async def _handle_subscription_cancel(data: dict):
     except Exception as exc:
         log.exception("DB error cancelling subscription: %s", exc)
 
-# ── ENDPOINT 5: GET /shorts/feed — HTTP Scraper + Postgres cache ────────────
+# ── ENDPOINT 5: GET /shorts/feed ─────────────────────────────────────────────
+#
+# ═════════════════════════════════════════════════════════════════════════════
+# PRIMARY SOURCE: seocloud.biz JSON BFF API  (discovered via DevTools inspection
+# of the real ifunny.club mobile traffic — see screenshot/header dump).
+#
+# This replaces the old "scrape rendered HTML / parse Next.js RSC streaming
+# payload" approach as the primary path. It's the same data the official site
+# itself calls, as plain JSON, with simple static headers and NO signature /
+# auth token — confirmed against a real captured 200 OK request:
+#
+#   GET https://api.seocloud.biz/wf/feed-seo-bff/post/explore?page=N&perPage=20
+#   GET https://api.seocloud.biz/wf/feed-seo-bff/community/{seoKey}?page=N&perPage=20
+#
+#   Required headers (all static, no per-request computation):
+#     Accept: application/json
+#     Origin: https://ifunny.club
+#     Referer: https://ifunny.club/
+#     X-Client-Info: {"package_name":"movieboxbuzz","timezone":"Africa/Lagos"}
+#     X-Request-Lang: en
+#     User-Agent: <any modern mobile UA>
+#
+# Response shape (data.items[]) gives us, per post:
+#   - media.video[0].url   → direct .mp4 (this is our hlsUrl/fallbackUrl)
+#   - media.cover.url      → poster/thumbnail
+#   - stat.likeCount / commentCount / shareCount → real engagement numbers
+#   - user.nickname, group.name → author/community display fields
+#   - data.pager.hasMore / nextPage → REAL pagination cursor, unlike the old
+#     scraper which only ever returned a fixed slice of ~30 items per slug.
+#     This is what makes "infinite scroll" actually infinite instead of
+#     capped — loadMore() now asks the API for the next page directly
+#     instead of re-scraping and hoping for different (shuffled) results.
+#
+# FALLBACK: if this API ever errors, times out, changes shape, or 4xx/5xxs,
+# we transparently fall back to the original RSC-JSON / HTML scraper
+# (scrape_community_http, unchanged below) for that slug/page so the feed
+# never goes fully dark just because an undocumented third-party endpoint
+# shifted under us.
+# ═════════════════════════════════════════════════════════════════════════════
+
+SEOCLOUD_BASE = "https://api.seocloud.biz/wf/feed-seo-bff"
+
+SEOCLOUD_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://ifunny.club",
+    "Referer": "https://ifunny.club/",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
+    "X-Client-Info": json.dumps({"package_name": "movieboxbuzz", "timezone": "Africa/Lagos"}),
+    "X-Request-Lang": "en",
+}
+
+PER_PAGE = 20
+
+def _seocloud_post_to_video(post: dict) -> Optional[dict]:
+    """Normalize one seocloud.biz post object into our internal video dict.
+    Mirrors _post_json_to_video's output shape so downstream code
+    (_to_short_video, caching, dedup) doesn't need to know which source a
+    video came from."""
+    media = post.get("media") or {}
+    videos = media.get("video") or []
+    if not videos:
+        return None
+    video_url = (videos[0] or {}).get("url", "")
+    if not video_url:
+        return None
+
+    cover = post.get("cover") or media.get("cover") or {}
+    thumb_url = cover.get("url", "") if cover else ""
+
+    stat = post.get("stat") or {}
+    user = post.get("user") or {}
+    group = post.get("group") or {}
+
+    return {
+        "id": post.get("postId", ""),
+        "mp4": video_url,
+        "thumb": thumb_url,
+        "title": (post.get("content", "") or "").strip(),
+        "author": user.get("nickname", "") or "",
+        "community": group.get("name", "") or "",
+        "ups": int(stat.get("likeCount", 0) or 0),
+        "comments": int(stat.get("commentCount", 0) or 0),
+        "duration": int((videos[0] or {}).get("duration", 0) or 0),
+        "width": int((videos[0] or {}).get("width", 0) or 0),
+        "height": int((videos[0] or {}).get("height", 0) or 0),
+    }
+
+async def fetch_seocloud_page(path: str, page: int) -> tuple[list[dict], bool]:
+    """
+    Calls one page of either /post/explore or /community/{seoKey} on the
+    seocloud BFF. Returns (videos, has_more). Raises on any failure so the
+    caller can fall back to scraping — we never want a silent empty result
+    here to look the same as "this slug genuinely has no more videos".
+    """
+    url = f"{SEOCLOUD_BASE}{path}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, params={"page": page, "perPage": PER_PAGE}, headers=SEOCLOUD_HEADERS)
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("code", 0) != 0:
+        raise ValueError(f"seocloud API returned code={body.get('code')} message={body.get('message')}")
+
+    data = body.get("data") or {}
+    items = data.get("items") or []
+    pager = data.get("pager") or {}
+
+    videos: list[dict] = []
+    seen_mp4 = set()
+    for item in items:
+        if item.get("itemType") != "POST":
+            continue
+        v = _seocloud_post_to_video(item)
+        if v and v["mp4"] not in seen_mp4:
+            seen_mp4.add(v["mp4"])
+            videos.append(v)
+
+    has_more = bool(pager.get("hasMore", False))
+    return videos, has_more
+
+async def fetch_explore_page(page: int) -> tuple[list[dict], bool]:
+    return await fetch_seocloud_page("/post/explore", page)
+
+async def fetch_community_page(seo_key: str, page: int) -> tuple[list[dict], bool]:
+    return await fetch_seocloud_page(f"/community/{seo_key}", page)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FALLBACK SOURCE: HTTP Scraper (RSC-JSON extraction + HTML scraping)
+#
+# Unchanged from the previous version — kept verbatim as the safety net for
+# when the seocloud BFF is unavailable. A "page" here always means page 0
+# (the scraper has no real pagination — it returns one fixed batch), which
+# is fine as a fallback since it only ever activates if the primary JSON
+# API call already failed for that slug.
+# ═════════════════════════════════════════════════════════════════════════════
 
 def clean_url(url: str, base_url: str) -> str:
     """Clean and normalize URLs."""
@@ -274,7 +439,7 @@ def clean_url(url: str, base_url: str) -> str:
 
     return url
 
-# ── NEW: extract posts from the embedded Next.js RSC JSON payload ───────────
+# ── extract posts from the embedded Next.js RSC JSON payload ────────────────
 #
 # ifunny.club (MovieBox.Buzz) is a Next.js app that server-renders each page
 # with the full post data embedded as JSON inside `self.__next_f.push(...)`
@@ -285,15 +450,8 @@ def clean_url(url: str, base_url: str) -> str:
 #    "stat":{"likeCount":...,"commentCount":...,"shareCount":...}, ...}
 #
 # This is far more reliable than scraping <video> tag attributes out of
-# rendered HTML:
-#   - The URL is a plain JSON string, never affected by HTML-entity or
-#     whitespace artifacts that previously caused broken/corrupted URLs.
-#   - Real engagement stats (likes/comments/shares) come for free, instead
-#     of the old placeholder math (ups/10) for comment count.
-#   - Real duration/width/height/fps/bitrate metadata is included.
-#
-# Falls back to the old HTML-scraping path if this extraction finds nothing,
-# in case ifunny.club changes their page structure.
+# rendered HTML, which is why it's tried first within the fallback path
+# (before the raw HTML/<video>-tag/regex scraping below it).
 
 _PUSH_PATTERN = re.compile(r'self\.__next_f\.push\(\[1,\s*(".*?")\]\)', re.DOTALL)
 
@@ -402,10 +560,11 @@ def _post_json_to_video(post: dict) -> Optional[dict]:
 
 async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
     """
-    Scrape ifunny.club for videos using HTTP requests.
+    Scrape ifunny.club for videos using HTTP requests. Used only as a
+    fallback when the seocloud BFF call fails for this slug.
     """
     url = f"{base_url}/community/{slug}"
-    log.info(f"Scraping: {url}")
+    log.info(f"Scraping (fallback): {url}")
 
     try:
         async with httpx.AsyncClient(
@@ -441,7 +600,7 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         seen_from_json.add(v["mp4"])
                         videos_from_json.append(v)
                 if videos_from_json:
-                    log.info(f"✓ {slug} → {len(videos_from_json)} videos via RSC JSON extraction")
+                    log.info(f"✓ {slug} → {len(videos_from_json)} videos via RSC JSON extraction (fallback)")
                     return videos_from_json[:30]
                 log.info(f"RSC JSON found {len(rsc_posts)} posts but none had usable video URLs — falling back to HTML scraping")
             else:
@@ -453,28 +612,23 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
             videos = []
             seen_urls = set()
 
-            # Find all video elements
             video_elements = soup.find_all('video')
             log.info(f"Found {len(video_elements)} video elements")
 
             for video in video_elements:
-                # Get video source from various attributes
                 src = video.get('src', '')
 
-                # Check for source tags
                 if not src:
                     source = video.find('source')
                     if source:
                         src = source.get('src', '')
 
-                # Check data attributes
                 if not src:
                     for attr in ['data-src', 'data-video', 'data-url', 'data-href']:
                         if video.get(attr):
                             src = video.get(attr)
                             break
 
-                # Get poster/thumbnail
                 poster = video.get('poster', '')
                 if not poster:
                     for attr in ['data-poster', 'data-thumb', 'data-thumbnail']:
@@ -482,7 +636,6 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                             poster = video.get(attr)
                             break
 
-                # Try to get video ID from parent links
                 video_id = f"vid_{len(videos)}"
                 parent = video.parent
                 for _ in range(6):
@@ -499,7 +652,6 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         break
                     parent = parent.parent
 
-                # Clean URL
                 if src:
                     src = clean_url(src, base_url)
 
@@ -507,22 +659,18 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         if src not in seen_urls:
                             seen_urls.add(src)
 
-                            # Clean poster URL
                             if poster:
                                 poster = clean_url(poster, base_url)
 
-                            # Try to find a title
                             title = ''
                             parent = video.parent
                             for _ in range(4):
                                 if not parent:
                                     break
-                                # Check for heading
                                 heading = parent.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
                                 if heading:
                                     title = heading.get_text(strip=True)
                                     break
-                                # Check for title attributes
                                 title_attrs = parent.find_all(attrs={'title': True})
                                 if title_attrs:
                                     title = title_attrs[0].get('title', '')
@@ -538,11 +686,9 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                                 'community': slug.split('-')[0].capitalize()
                             })
 
-            # If no videos found, search HTML for MP4 URLs
             if not videos:
                 log.info("No video tags found, searching HTML for MP4 URLs...")
 
-                # Find all MP4 URLs in HTML
                 mp4_pattern = r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*'
                 mp4_urls = re.findall(mp4_pattern, html)
 
@@ -552,7 +698,6 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         continue
                     seen_urls.add(mp4_url)
 
-                    # Try to find thumbnail nearby
                     thumb = ''
                     context = html[max(0, html.find(raw_mp4_url) - 500):html.find(raw_mp4_url) + 500]
                     thumb_pattern = r'https?://[^\s"\'<>]+\.(?:jpg|png|jpeg|webp|gif)'
@@ -569,7 +714,7 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         'community': slug.split('-')[0].capitalize()
                     })
 
-            log.info(f"✓ {slug} → {len(videos)} videos found")
+            log.info(f"✓ {slug} → {len(videos)} videos found (fallback)")
             return videos[:30]
 
     except Exception as e:
@@ -593,118 +738,163 @@ def _to_short_video(v: dict) -> dict:
         "height": v.get("height", 0),
     }
 
-# ── Feed cache (Postgres-backed, stale-while-revalidate) ──────────────────────
+# ── Source dispatch: seocloud BFF first, scraper fallback ───────────────────
 #
-# Read path:
-#   1. Cache row missing entirely      -> scrape synchronously, write cache, return fresh
+# `slug` here is the community seoKey (e.g. "lol-loop-GfRk3IGcil2"), or the
+# special value "__explore__" for the For You / explore feed which has no
+# community context.
+
+EXPLORE_SLUG = "__explore__"
+
+async def fetch_page_for_slug(base_url: str, slug: str, page: int) -> tuple[list[dict], bool]:
+    """
+    Returns (videos, has_more) for one page of one slug. Tries the seocloud
+    JSON BFF first; falls back to HTML/RSC scraping (page 0 only, has_more
+    forced False since the scraper has no real cursor) if the BFF call
+    raises for any reason.
+    """
+    try:
+        if slug == EXPLORE_SLUG:
+            return await fetch_explore_page(page)
+        return await fetch_community_page(slug, page)
+    except Exception as exc:
+        log.warning(f"seocloud BFF failed for slug={slug} page={page}: {exc} — falling back to scraper")
+        if page > 0:
+            # The scraper has no pagination concept — only page 0 is ever
+            # worth attempting as a fallback. Further pages simply have no
+            # more content available via this path.
+            return [], False
+        scraped = await scrape_community_http(base_url, slug if slug != EXPLORE_SLUG else "all")
+        random.shuffle(scraped)
+        return scraped, False
+
+# ── Feed cache (Postgres-backed, stale-while-revalidate, per page) ──────────
+#
+# Read path per (slug, page):
+#   1. Cache row missing entirely      -> fetch synchronously, write cache, return fresh
 #   2. Cache row present and fresh     -> return cached immediately
 #   3. Cache row present but stale     -> return cached immediately AND
 #                                          kick off a background refresh for next time
 #
-# This means a real scrape only ever blocks a user request the very first
-# time a slug is ever requested. Every request after that is instant.
+# Caching is now keyed by "slug:page" instead of just "slug" — this is the
+# core fix that makes infinite scroll genuinely infinite: each page the
+# client asks for (as it scrolls) is fetched and cached independently, so
+# loadMore() can keep advancing the page cursor instead of re-requesting
+# the same fixed batch over and over.
 
-# Tracks slugs currently being refreshed in the background so we don't
-# fire duplicate scrapes if multiple requests land while one is in flight.
 _refresh_in_progress: set[str] = set()
 
-def _read_cache(cur, slug: str) -> Optional[dict]:
-    cur.execute("SELECT videos, cached_at FROM feed_cache WHERE slug = %s", (slug,))
+def _cache_key(slug: str, page: int) -> str:
+    return f"{slug}:{page}"
+
+def _read_cache(cur, cache_key: str) -> Optional[dict]:
+    cur.execute("SELECT videos, has_more, cached_at FROM feed_cache WHERE cache_key = %s", (cache_key,))
     return cur.fetchone()
 
-def _write_cache(slug: str, videos: list[dict]):
+def _write_cache(cache_key: str, videos: list[dict], has_more: bool):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO feed_cache (slug, videos, cached_at)
-                    VALUES (%s, %s, now())
-                    ON CONFLICT (slug) DO UPDATE SET
-                        videos = EXCLUDED.videos, cached_at = EXCLUDED.cached_at
-                """, (slug, json.dumps(videos)))
+                    INSERT INTO feed_cache (cache_key, videos, has_more, cached_at)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (cache_key) DO UPDATE SET
+                        videos = EXCLUDED.videos, has_more = EXCLUDED.has_more, cached_at = EXCLUDED.cached_at
+                """, (cache_key, json.dumps(videos), has_more))
             conn.commit()
     except Exception:
-        log.exception(f"Failed writing feed cache for slug={slug}")
+        log.exception(f"Failed writing feed cache for key={cache_key}")
 
-async def _scrape_and_cache(base_url: str, slug: str) -> list[dict]:
-    videos = await scrape_community_http(base_url, slug)
-    # Shuffle once at write-time so repeated reads within the TTL window
-    # stay in a stable order (no re-shuffling on every loadMore/refresh).
-    random.shuffle(videos)
-    _write_cache(slug, videos)
-    return videos
+async def _fetch_and_cache(base_url: str, slug: str, page: int) -> tuple[list[dict], bool]:
+    videos, has_more = await fetch_page_for_slug(base_url, slug, page)
+    cache_key = _cache_key(slug, page)
+    _write_cache(cache_key, videos, has_more)
+    return videos, has_more
 
-def _schedule_background_refresh(base_url: str, slug: str):
-    if slug in _refresh_in_progress:
+def _schedule_background_refresh(base_url: str, slug: str, page: int):
+    cache_key = _cache_key(slug, page)
+    if cache_key in _refresh_in_progress:
         return
-    _refresh_in_progress.add(slug)
+    _refresh_in_progress.add(cache_key)
 
     async def _run():
         try:
-            await _scrape_and_cache(base_url, slug)
-            log.info(f"↻ background refresh complete for slug={slug}")
+            await _fetch_and_cache(base_url, slug, page)
+            log.info(f"↻ background refresh complete for key={cache_key}")
         finally:
-            _refresh_in_progress.discard(slug)
+            _refresh_in_progress.discard(cache_key)
 
     asyncio.create_task(_run())
 
-async def get_videos_for_slug(base_url: str, slug: str) -> list[dict]:
+async def get_videos_for_slug_page(base_url: str, slug: str, page: int) -> tuple[list[dict], bool]:
+    cache_key = _cache_key(slug, page)
     with get_conn() as conn:
         with conn.cursor() as cur:
-            row = _read_cache(cur, slug)
+            row = _read_cache(cur, cache_key)
 
     if row is None:
-        # Never cached before — this request pays the scrape cost once.
-        log.info(f"cache MISS slug={slug} — scraping synchronously")
-        return await _scrape_and_cache(base_url, slug)
+        log.info(f"cache MISS key={cache_key} — fetching synchronously")
+        return await _fetch_and_cache(base_url, slug, page)
 
     age = (datetime.now(timezone.utc) - row["cached_at"]).total_seconds()
     videos = row["videos"]
+    has_more = row["has_more"]
 
     if age > FEED_CACHE_TTL_SECONDS:
-        log.info(f"cache STALE slug={slug} age={int(age)}s — serving stale + refreshing in background")
-        _schedule_background_refresh(base_url, slug)
+        log.info(f"cache STALE key={cache_key} age={int(age)}s — serving stale + refreshing in background")
+        _schedule_background_refresh(base_url, slug, page)
     else:
-        log.info(f"cache HIT slug={slug} age={int(age)}s")
+        log.info(f"cache HIT key={cache_key} age={int(age)}s")
 
-    return videos
+    return videos, has_more
 
 @app.get("/shorts/feed")
 async def shorts_feed(
-    subs: str = Query(..., description='"+"-separated community slugs'),
+    subs: str = Query(..., description='"+"-separated community seoKeys, or "explore" for the For-You feed'),
     base_url: str = Query("https://ifunny.club"),
+    page: int = Query(0, ge=0, description="Page cursor for pagination — increment this to load more"),
 ):
-    slugs = [s.strip() for s in subs.replace("%2B", "+").split("+") if s.strip()]
-    if not slugs:
+    raw_slugs = [s.strip() for s in subs.replace("%2B", "+").split("+") if s.strip()]
+    if not raw_slugs:
         raise HTTPException(status_code=400, detail="subs param is required")
 
-    slugs = slugs[:5]
+    # "explore" is the magic value the app sends for the For-You feed (no
+    # specific community context) — maps onto the seocloud /post/explore
+    # endpoint rather than a community seoKey.
+    slugs = [EXPLORE_SLUG if s.lower() == "explore" else s for s in raw_slugs][:5]
 
-    tasks = [get_videos_for_slug(base_url, slug) for slug in slugs]
+    tasks = [get_videos_for_slug_page(base_url, slug, page) for slug in slugs]
     results = await asyncio.gather(*tasks)
 
     merged, seen_urls = [], set()
-    for group in results:
-        for v in group:
+    any_has_more = False
+    for group_videos, group_has_more in results:
+        any_has_more = any_has_more or group_has_more
+        for v in group_videos:
             if v["mp4"] not in seen_urls:
                 seen_urls.add(v["mp4"])
                 merged.append(v)
 
-    log.info(f"shorts/feed → {len(merged)} total videos")
+    log.info(f"shorts/feed page={page} → {len(merged)} total videos, hasMore={any_has_more}")
 
-    return {"videos": [_to_short_video(v) for v in merged], "count": len(merged)}
+    return {
+        "videos": [_to_short_video(v) for v in merged],
+        "count": len(merged),
+        "hasMore": any_has_more,
+        "nextPage": page + 1,
+    }
 
 @app.post("/shorts/cache/clear")
-async def clear_feed_cache(slug: Optional[str] = Query(None, description="Clear one slug, or omit to clear all")):
+async def clear_feed_cache(slug: Optional[str] = Query(None, description="Clear one slug (all its pages), or omit to clear all")):
     """
-    Manually invalidate the feed cache. Useful right after a scraper fix so a
-    previously-cached batch of (possibly broken) URLs doesn't keep being
+    Manually invalidate the feed cache. Useful right after a backend fix so
+    a previously-cached (possibly broken) batch of URLs doesn't keep being
     served for the rest of its TTL window.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
             if slug:
-                cur.execute("DELETE FROM feed_cache WHERE slug = %s", (slug,))
+                cur.execute("DELETE FROM feed_cache WHERE cache_key LIKE %s", (f"{slug}:%",))
             else:
                 cur.execute("DELETE FROM feed_cache")
             cleared = cur.rowcount
@@ -727,7 +917,7 @@ async def root():
             "/payments/init": "POST - Initialize payment",
             "/subscription/status": "GET - Check subscription status",
             "/webhook/paystack": "POST - Paystack webhook",
-            "/shorts/feed": "GET - Get video feed",
+            "/shorts/feed": "GET - Get video feed (?subs=explore|seoKey1+seoKey2&page=0)",
             "/health": "GET - Health check"
         }
     }
