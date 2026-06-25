@@ -362,6 +362,11 @@ def _seocloud_post_to_video(post: dict) -> Optional[dict]:
         "duration": int((videos[0] or {}).get("duration", 0) or 0),
         "width": int((videos[0] or {}).get("width", 0) or 0),
         "height": int((videos[0] or {}).get("height", 0) or 0),
+        # Lets /shorts/feed report exactly which path served this video —
+        # see the "source" field on the response and the X-Feed-Source
+        # header. This is how you verify the API is actually being used
+        # instead of guessing from playback alone.
+        "source": "api",
     }
 
 async def fetch_seocloud_page(path: str, page: int) -> tuple[list[dict], bool]:
@@ -555,6 +560,7 @@ def _post_json_to_video(post: dict) -> Optional[dict]:
         "comments": int(stat.get("commentCount", 0) or 0),
         "duration": int((videos[0] or {}).get("duration", 0) or 0),
         "width": int((videos[0] or {}).get("width", 0) or 0),
+        "source": "scraper",
         "height": int((videos[0] or {}).get("height", 0) or 0),
     }
 
@@ -683,7 +689,8 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                                 'thumb': poster if poster else '',
                                 'title': title if title else f"Video {len(videos) + 1}",
                                 'author': slug.split('-')[0].capitalize(),
-                                'community': slug.split('-')[0].capitalize()
+                                'community': slug.split('-')[0].capitalize(),
+                                'source': 'scraper',
                             })
 
             if not videos:
@@ -711,7 +718,8 @@ async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
                         'thumb': thumb,
                         'title': f"Video {idx + 1}",
                         'author': slug.split('-')[0].capitalize(),
-                        'community': slug.split('-')[0].capitalize()
+                        'community': slug.split('-')[0].capitalize(),
+                        'source': 'scraper',
                     })
 
             log.info(f"✓ {slug} → {len(videos)} videos found (fallback)")
@@ -735,6 +743,12 @@ def _to_short_video(v: dict) -> dict:
         "duration": v.get("duration", 0),
         "hasAudio": True,
         "width": v.get("width", 0),
+        # "api" = served by the seocloud.biz JSON BFF, "scraper" = served by
+        # the HTML/RSC-JSON fallback. Check this field (or the response's
+        # top-level "sourceCounts" / the X-Feed-Source header) to confirm
+        # which path actually produced a given batch instead of guessing
+        # from playback behavior alone.
+        "source": v.get("source", "unknown"),
         "height": v.get("height", 0),
     }
 
@@ -875,13 +889,28 @@ async def shorts_feed(
                 seen_urls.add(v["mp4"])
                 merged.append(v)
 
-    log.info(f"shorts/feed page={page} → {len(merged)} total videos, hasMore={any_has_more}")
+    # Quick visibility into which path actually served this batch, without
+    # needing to inspect individual video objects. Check this log line (or
+    # the "sourceCounts" field below) any time you want to confirm the
+    # seocloud API is doing the work vs the HTML/RSC scraper fallback.
+    api_count = sum(1 for v in merged if v.get("source") == "api")
+    scraper_count = sum(1 for v in merged if v.get("source") == "scraper")
+    log.info(
+        f"shorts/feed page={page} slugs={slugs} → {len(merged)} total "
+        f"(api={api_count}, scraper={scraper_count}), hasMore={any_has_more}"
+    )
 
     return {
         "videos": [_to_short_video(v) for v in merged],
         "count": len(merged),
         "hasMore": any_has_more,
         "nextPage": page + 1,
+        # Per-source breakdown for this response. If scraper > 0, the
+        # seocloud BFF call failed for at least one slug/page in this
+        # request and the HTML/RSC fallback covered for it — check the
+        # server logs for "falling back to scraper" around this timestamp
+        # to see which slug and why.
+        "sourceCounts": {"api": api_count, "scraper": scraper_count},
     }
 
 @app.post("/shorts/cache/clear")
