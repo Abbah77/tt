@@ -7,15 +7,11 @@ import hmac
 import json
 import logging
 import os
-import re
-import random
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -309,11 +305,13 @@ async def _handle_subscription_cancel(data: dict):
 #     capped — loadMore() now asks the API for the next page directly
 #     instead of re-scraping and hoping for different (shuffled) results.
 #
-# FALLBACK: if this API ever errors, times out, changes shape, or 4xx/5xxs,
-# we transparently fall back to the original RSC-JSON / HTML scraper
-# (scrape_community_http, unchanged below) for that slug/page so the feed
-# never goes fully dark just because an undocumented third-party endpoint
-# shifted under us.
+# PURE API BUILD — no scraper fallback. If this endpoint errors, times out,
+# changes shape, or 4xx/5xxs, the request fails loudly (502) instead of
+# silently degrading. This is intentional: the point of this build is to
+# find out, definitively, whether the API alone is reliable enough to
+# depend on. Watch your server logs/error rates — if 502s show up, that's
+# your answer, and you'd reintroduce the RSC-JSON/HTML scraper as a
+# fallback for whichever slug/page is failing.
 # ═════════════════════════════════════════════════════════════════════════════
 
 SEOCLOUD_BASE = "https://api.seocloud.biz/wf/feed-seo-bff"
@@ -331,10 +329,7 @@ SEOCLOUD_HEADERS = {
 PER_PAGE = 20
 
 def _seocloud_post_to_video(post: dict) -> Optional[dict]:
-    """Normalize one seocloud.biz post object into our internal video dict.
-    Mirrors _post_json_to_video's output shape so downstream code
-    (_to_short_video, caching, dedup) doesn't need to know which source a
-    video came from."""
+    """Normalize one seocloud.biz post object into our internal video dict."""
     media = post.get("media") or {}
     videos = media.get("video") or []
     if not videos:
@@ -407,327 +402,6 @@ async def fetch_explore_page(page: int) -> tuple[list[dict], bool]:
 async def fetch_community_page(seo_key: str, page: int) -> tuple[list[dict], bool]:
     return await fetch_seocloud_page(f"/community/{seo_key}", page)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# FALLBACK SOURCE: HTTP Scraper (RSC-JSON extraction + HTML scraping)
-#
-# Unchanged from the previous version — kept verbatim as the safety net for
-# when the seocloud BFF is unavailable. A "page" here always means page 0
-# (the scraper has no real pagination — it returns one fixed batch), which
-# is fine as a fallback since it only ever activates if the primary JSON
-# API call already failed for that slug.
-# ═════════════════════════════════════════════════════════════════════════════
-
-def clean_url(url: str, base_url: str) -> str:
-    """Clean and normalize URLs."""
-    if not url:
-        return ''
-
-    # .strip() only removes LEADING/TRAILING whitespace — it does nothing
-    # about whitespace embedded in the middle of the path (e.g. a stray
-    # space or HTML entity like &nbsp;/\xa0 picked up from the source page,
-    # which silently breaks the object key on CDNs like Aliyun OSS and
-    # produces a 404 even though the URL "looks" fine when printed).
-    # Strip ALL whitespace characters (regular space, tab, non-breaking
-    # space, etc.) anywhere in the string before doing anything else.
-    url = re.sub(r'\s+', '', url)
-
-    if not url:
-        return ''
-
-    # Handle relative URLs
-    if url.startswith('//'):
-        return 'https:' + url
-    elif url.startswith('/'):
-        return urljoin(base_url, url)
-    elif not url.startswith('http'):
-        return urljoin(base_url, url)
-
-    return url
-
-# ── extract posts from the embedded Next.js RSC JSON payload ────────────────
-#
-# ifunny.club (MovieBox.Buzz) is a Next.js app that server-renders each page
-# with the full post data embedded as JSON inside `self.__next_f.push(...)`
-# script tags (React Server Components streaming format). Each post object
-# looks like:
-#   {"itemType":"POST","postId":"...","media":{"video":[{"url":"https://
-#    macdn.aoneroom.com/.../xyz.mp4","size":...,"duration":...}]},
-#    "stat":{"likeCount":...,"commentCount":...,"shareCount":...}, ...}
-#
-# This is far more reliable than scraping <video> tag attributes out of
-# rendered HTML, which is why it's tried first within the fallback path
-# (before the raw HTML/<video>-tag/regex scraping below it).
-
-_PUSH_PATTERN = re.compile(r'self\.__next_f\.push\(\[1,\s*(".*?")\]\)', re.DOTALL)
-
-def _extract_balanced_json_array(text: str, start_idx: int) -> Optional[str]:
-    """
-    Given the index of the opening '[' of a JSON array within `text`,
-    return the substring of the full, balanced array (respecting nested
-    brackets and quoted strings so commas/brackets inside string values
-    don't break the match).
-    """
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start_idx, len(text)):
-        ch = text[i]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == '\\':
-                escape = True
-            elif ch == '"':
-                in_string = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch == '[':
-                depth += 1
-            elif ch == ']':
-                depth -= 1
-                if depth == 0:
-                    return text[start_idx:i + 1]
-    return None
-
-def extract_posts_from_rsc_json(html: str) -> list[dict]:
-    """
-    Find and parse the `initialItems` (community/home feed) array embedded
-    in the page's Next.js RSC streaming payload. Returns a list of raw post
-    dicts in ifunny.club's own schema (NOT yet normalized to our ShortVideo
-    shape — see _post_json_to_video below for that).
-    """
-    posts: list[dict] = []
-    seen_post_ids: set[str] = set()
-
-    for match in _PUSH_PATTERN.finditer(html):
-        raw_literal = match.group(1)
-        try:
-            # raw_literal is itself a JSON string literal (quoted, with
-            # escaped inner quotes) — json.loads() on it gives us the
-            # properly unescaped inner string to search/parse further.
-            unescaped = json.loads(raw_literal)
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-        search_from = 0
-        while True:
-            marker_idx = unescaped.find('"initialItems":[', search_from)
-            if marker_idx == -1:
-                break
-            array_start = marker_idx + len('"initialItems":')
-            array_text = _extract_balanced_json_array(unescaped, array_start)
-            search_from = array_start + 1
-            if not array_text:
-                continue
-            try:
-                items = json.loads(array_text)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            for item in items:
-                pid = item.get("postId", "")
-                if pid and pid not in seen_post_ids:
-                    seen_post_ids.add(pid)
-                    posts.append(item)
-
-    return posts
-
-def _post_json_to_video(post: dict) -> Optional[dict]:
-    """Normalize one ifunny.club post JSON object into our internal video dict."""
-    media = post.get("media") or {}
-    videos = media.get("video") or []
-    if not videos:
-        return None
-    video_url = (videos[0] or {}).get("url", "")
-    if not video_url:
-        return None
-
-    cover = post.get("cover") or media.get("cover") or {}
-    thumb_url = cover.get("url", "")
-
-    stat = post.get("stat") or {}
-    user = post.get("user") or {}
-    group = post.get("group") or {}
-
-    return {
-        "id": post.get("postId", ""),
-        "mp4": video_url,
-        "thumb": thumb_url,
-        "title": post.get("content", "") or "",
-        "author": user.get("nickname", "") or "",
-        "community": group.get("name", "") or "",
-        "ups": int(stat.get("likeCount", 0) or 0),
-        "comments": int(stat.get("commentCount", 0) or 0),
-        "duration": int((videos[0] or {}).get("duration", 0) or 0),
-        "width": int((videos[0] or {}).get("width", 0) or 0),
-        "source": "scraper",
-        "height": int((videos[0] or {}).get("height", 0) or 0),
-    }
-
-async def scrape_community_http(base_url: str, slug: str) -> list[dict]:
-    """
-    Scrape ifunny.club for videos using HTTP requests. Used only as a
-    fallback when the seocloud BFF call fails for this slug.
-    """
-    url = f"{base_url}/community/{slug}"
-    log.info(f"Scraping (fallback): {url}")
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=30,
-            follow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Referer": base_url + "/",
-                "Origin": base_url,
-            }
-        ) as client:
-            resp = await client.get(url)
-
-            if resp.status_code != 200:
-                log.warning(f"Failed to fetch {url}: {resp.status_code}")
-                return []
-
-            html = resp.text
-
-            # ── Try the reliable JSON extraction first ────────────────────
-            rsc_posts = extract_posts_from_rsc_json(html)
-            if rsc_posts:
-                videos_from_json = []
-                seen_from_json = set()
-                for post in rsc_posts:
-                    v = _post_json_to_video(post)
-                    if v and v["mp4"] not in seen_from_json:
-                        seen_from_json.add(v["mp4"])
-                        videos_from_json.append(v)
-                if videos_from_json:
-                    log.info(f"✓ {slug} → {len(videos_from_json)} videos via RSC JSON extraction (fallback)")
-                    return videos_from_json[:30]
-                log.info(f"RSC JSON found {len(rsc_posts)} posts but none had usable video URLs — falling back to HTML scraping")
-            else:
-                log.info("No RSC JSON initialItems found — falling back to HTML scraping")
-
-            # ── Fallback: old HTML <video> tag / regex scraping ───────────
-            soup = BeautifulSoup(html, 'html.parser')
-
-            videos = []
-            seen_urls = set()
-
-            video_elements = soup.find_all('video')
-            log.info(f"Found {len(video_elements)} video elements")
-
-            for video in video_elements:
-                src = video.get('src', '')
-
-                if not src:
-                    source = video.find('source')
-                    if source:
-                        src = source.get('src', '')
-
-                if not src:
-                    for attr in ['data-src', 'data-video', 'data-url', 'data-href']:
-                        if video.get(attr):
-                            src = video.get(attr)
-                            break
-
-                poster = video.get('poster', '')
-                if not poster:
-                    for attr in ['data-poster', 'data-thumb', 'data-thumbnail']:
-                        if video.get(attr):
-                            poster = video.get(attr)
-                            break
-
-                video_id = f"vid_{len(videos)}"
-                parent = video.parent
-                for _ in range(6):
-                    if not parent:
-                        break
-                    links = parent.find_all('a', href=True)
-                    for link in links:
-                        href = link.get('href', '')
-                        match = re.search(r'/(video|post|gif|content)/([A-Za-z0-9_-]+)', href)
-                        if match:
-                            video_id = match.group(2)
-                            break
-                    if video_id != f"vid_{len(videos)}":
-                        break
-                    parent = parent.parent
-
-                if src:
-                    src = clean_url(src, base_url)
-
-                    if '.mp4' in src.lower() or '/video/' in src.lower():
-                        if src not in seen_urls:
-                            seen_urls.add(src)
-
-                            if poster:
-                                poster = clean_url(poster, base_url)
-
-                            title = ''
-                            parent = video.parent
-                            for _ in range(4):
-                                if not parent:
-                                    break
-                                heading = parent.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-                                if heading:
-                                    title = heading.get_text(strip=True)
-                                    break
-                                title_attrs = parent.find_all(attrs={'title': True})
-                                if title_attrs:
-                                    title = title_attrs[0].get('title', '')
-                                    break
-                                parent = parent.parent
-
-                            videos.append({
-                                'id': video_id,
-                                'mp4': src,
-                                'thumb': poster if poster else '',
-                                'title': title if title else f"Video {len(videos) + 1}",
-                                'author': slug.split('-')[0].capitalize(),
-                                'community': slug.split('-')[0].capitalize(),
-                                'source': 'scraper',
-                            })
-
-            if not videos:
-                log.info("No video tags found, searching HTML for MP4 URLs...")
-
-                mp4_pattern = r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*'
-                mp4_urls = re.findall(mp4_pattern, html)
-
-                for idx, raw_mp4_url in enumerate(mp4_urls[:30]):
-                    mp4_url = re.sub(r'\s+', '', raw_mp4_url)
-                    if not mp4_url or mp4_url in seen_urls:
-                        continue
-                    seen_urls.add(mp4_url)
-
-                    thumb = ''
-                    context = html[max(0, html.find(raw_mp4_url) - 500):html.find(raw_mp4_url) + 500]
-                    thumb_pattern = r'https?://[^\s"\'<>]+\.(?:jpg|png|jpeg|webp|gif)'
-                    thumbs = re.findall(thumb_pattern, context)
-                    if thumbs:
-                        thumb = re.sub(r'\s+', '', thumbs[0])
-
-                    videos.append({
-                        'id': f"mp4_{idx}",
-                        'mp4': mp4_url,
-                        'thumb': thumb,
-                        'title': f"Video {idx + 1}",
-                        'author': slug.split('-')[0].capitalize(),
-                        'community': slug.split('-')[0].capitalize(),
-                        'source': 'scraper',
-                    })
-
-            log.info(f"✓ {slug} → {len(videos)} videos found (fallback)")
-            return videos[:30]
-
-    except Exception as e:
-        log.exception(f"✗ Failed to scrape {slug}: {e}")
-        return []
 
 def _to_short_video(v: dict) -> dict:
     return {
@@ -743,44 +417,38 @@ def _to_short_video(v: dict) -> dict:
         "duration": v.get("duration", 0),
         "hasAudio": True,
         "width": v.get("width", 0),
-        # "api" = served by the seocloud.biz JSON BFF, "scraper" = served by
-        # the HTML/RSC-JSON fallback. Check this field (or the response's
-        # top-level "sourceCounts" / the X-Feed-Source header) to confirm
-        # which path actually produced a given batch instead of guessing
-        # from playback behavior alone.
-        "source": v.get("source", "unknown"),
+        # Always "api" in this pure-API build — kept on the response so the
+        # client-side code that already reads this field doesn't need to
+        # change if the scraper fallback is reintroduced later.
+        "source": v.get("source", "api"),
         "height": v.get("height", 0),
     }
 
-# ── Source dispatch: seocloud BFF first, scraper fallback ───────────────────
+# ── Source dispatch: seocloud BFF only, no scraper fallback ─────────────────
 #
 # `slug` here is the community seoKey (e.g. "lol-loop-GfRk3IGcil2"), or the
 # special value "__explore__" for the For You / explore feed which has no
 # community context.
+#
+# This is the "pure API" build — if api.seocloud.biz fails, this raises and
+# the request fails loudly (502), rather than silently degrading to the
+# HTML/RSC scraper. That's intentional: the whole point of this version is
+# to find out definitively whether the API alone is reliable enough to
+# depend on, without a scraper masking failures. If you start seeing 502s
+# in your logs/app, that's your answer — swap back to the version with the
+# scraper fallback.
 
 EXPLORE_SLUG = "__explore__"
 
 async def fetch_page_for_slug(base_url: str, slug: str, page: int) -> tuple[list[dict], bool]:
     """
-    Returns (videos, has_more) for one page of one slug. Tries the seocloud
-    JSON BFF first; falls back to HTML/RSC scraping (page 0 only, has_more
-    forced False since the scraper has no real cursor) if the BFF call
-    raises for any reason.
+    Returns (videos, has_more) for one page of one slug, via the seocloud
+    JSON BFF only. `base_url` is accepted for call-site compatibility with
+    the scraper-fallback version but is unused here.
     """
-    try:
-        if slug == EXPLORE_SLUG:
-            return await fetch_explore_page(page)
-        return await fetch_community_page(slug, page)
-    except Exception as exc:
-        log.warning(f"seocloud BFF failed for slug={slug} page={page}: {exc} — falling back to scraper")
-        if page > 0:
-            # The scraper has no pagination concept — only page 0 is ever
-            # worth attempting as a fallback. Further pages simply have no
-            # more content available via this path.
-            return [], False
-        scraped = await scrape_community_http(base_url, slug if slug != EXPLORE_SLUG else "all")
-        random.shuffle(scraped)
-        return scraped, False
+    if slug == EXPLORE_SLUG:
+        return await fetch_explore_page(page)
+    return await fetch_community_page(slug, page)
 
 # ── Feed cache (Postgres-backed, stale-while-revalidate, per page) ──────────
 #
