@@ -367,9 +367,9 @@ def _seocloud_post_to_video(post: dict) -> Optional[dict]:
 async def fetch_seocloud_page(path: str, page: int) -> tuple[list[dict], bool]:
     """
     Calls one page of either /post/explore or /community/{seoKey} on the
-    seocloud BFF. Returns (videos, has_more). Raises on any failure so the
-    caller can fall back to scraping — we never want a silent empty result
-    here to look the same as "this slug genuinely has no more videos".
+    seocloud BFF. Returns (videos, has_more). Raises on any failure — this
+    is the pure-API build, so a failure here surfaces as a real error
+    rather than being silently masked.
     """
     url = f"{SEOCLOUD_BASE}{path}"
     async with httpx.AsyncClient(timeout=15) as client:
@@ -397,7 +397,23 @@ async def fetch_seocloud_page(path: str, page: int) -> tuple[list[dict], bool]:
     return videos, has_more
 
 async def fetch_explore_page(page: int) -> tuple[list[dict], bool]:
-    return await fetch_seocloud_page("/post/explore", page)
+    # Confirmed from live traffic capture: GET .../post/explore?page=3
+    # returns 200 with real data, but our own page=0 (the very first
+    # request, on cold cache) reproducibly 404s — see the traceback from
+    # 2026-06-26 in server logs. /community/{seoKey} has no such issue at
+    # page=0, so this looks specific to /post/explore being 1-indexed
+    # rather than 0-indexed.
+    #
+    # We apply a consistent +1 offset to EVERY explore page rather than
+    # only retrying page=0 on 404: a retry-only approach would desync
+    # subsequent pages (our page=1 would re-fetch their page=1 — the same
+    # content the retry already returned — instead of advancing to their
+    # page=2), silently duplicating videos across "pages" as the user
+    # scrolls. A flat offset keeps our page→their page mapping 1:1 and
+    # predictable. If seocloud fixes page=0 on their end later, this
+    # offset would need to be removed — watch for that by occasionally
+    # testing without it.
+    return await fetch_seocloud_page("/post/explore", page + 1)
 
 async def fetch_community_page(seo_key: str, page: int) -> tuple[list[dict], bool]:
     return await fetch_seocloud_page(f"/community/{seo_key}", page)
